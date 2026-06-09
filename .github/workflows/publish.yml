@@ -6,8 +6,28 @@ on:
         description: Dry run (no actual publish)
         type: boolean
         default: true
+
 jobs:
-  stub:
+  publish:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "stub"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - uses: taiki-e/install-action@e75cfd3544e409eb8da0d09dd5d918cd3e6e3982 # just
+
+      - name: Install cargo-release-oxc
+        run: cargo install --git https://github.com/oxc-project/cargo-release-oxc
+
+      - name: Publish (dry run)
+        if: inputs.dry_run
+        run: just publish-dry
+
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: just publish
