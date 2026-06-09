@@ -1,5 +1,5 @@
 [package]
-name = "forked_react_compiler_validation"
+name = "nextjs_react_compiler_validation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

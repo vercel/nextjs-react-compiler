@@ -1,5 +1,5 @@
 [package]
-name = "forked_react_compiler_inference"
+name = "nextjs_react_compiler_inference"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,7 +1,7 @@
 # Maintenance
 
 How to keep `react-compiler/` in sync with upstream and publish the
-`forked_react_compiler_*` crates to crates.io.
+`nextjs_react_compiler_*` crates to crates.io.
 
 All recipes live in the [`justfile`](./justfile); run `just --list` for the full set.
 
@@ -25,7 +25,7 @@ gh pr create --fill && gh pr merge --squash --auto
 ```
 
 The codemod edits **only** `Cargo.toml` files: it sets each crate's published `[package] name` to
-`forked_react_compiler_*` while keeping the `[lib] name` (and source/dirs) as upstream's
+`nextjs_react_compiler_*` while keeping the `[lib] name` (and source/dirs) as upstream's
 `react_compiler_*`, wires up workspace inheritance, and marks each crate `publish = true`/`false`.
 
 ## Releasing to crates.io
@@ -68,7 +68,7 @@ From an up-to-date, clean `main`:
 just publish        # cd react-compiler && cargo release-oxc publish --release crates
 ```
 
-This publishes `forked_react_compiler` plus its 11 transitive deps **bottom-up** (deps before
+This publishes `nextjs_react_compiler` plus its 11 transitive deps **bottom-up** (deps before
 dependents, 12 crates total), skipping the `publish = false` crates
 (`*_oxc`, `*_swc`, `*_napi`, `*_e2e_cli`). cargo-release-oxc waits for each crate to appear on the
 index before publishing its dependents.
@@ -81,7 +81,7 @@ just publish-dry    # cargo publish --workspace --dry-run
 
 > [!NOTE]
 > A dry run **fails partway through** with `failed to select a version for the requirement
-> forked_react_compiler_X = "^<version>"` — this is expected. Nothing is actually uploaded in a dry
+> nextjs_react_compiler_X = "^<version>"` — this is expected. Nothing is actually uploaded in a dry
 > run, so each dependent crate can't find its just-"published" dep on the index. The real
 > `just publish` succeeds because it uploads bottom-up and each dep exists before its dependents are
 > packaged. The dry run still confirms the leaf crates package cleanly.
