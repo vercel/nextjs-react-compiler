@@ -6,8 +6,52 @@ on:
         description: Allow empty commit (useful for testing the workflow)
         type: boolean
         default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  stub:
+  bump:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "stub"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cargo-release-oxc
+        run: cargo install --git https://github.com/oxc-project/cargo-release-oxc
+
+      - name: Bump version and generate changelog
+        working-directory: react-compiler
+        run: cargo release-oxc update --release crates
+
+      - name: Read new version
+        id: version
+        run: echo "value=$(cat react-compiler/target/crates_VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Create branch and open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.value }}"
+          BRANCH="release/v${VERSION}"
+          git checkout -b "$BRANCH"
+          git add -A react-compiler
+          git commit -m "release: bump to ${VERSION}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "release: bump to ${VERSION}" \
+            --body "Version bump via \`cargo release-oxc update\`. Merge this, then run the **Publish Crates** workflow against \`main\`." \
+            --base main \
+            --head "$BRANCH"
