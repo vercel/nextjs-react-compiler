@@ -2,12 +2,53 @@ name: Bump Version
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: New version (e.g. 0.1.5)
+        type: string
+        required: true
       allow_empty:
         description: Allow empty commit (useful for testing the workflow)
         type: boolean
         default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  stub:
+  bump:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "stub"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: '.node-version'
+          cache: 'pnpm'
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - uses: taiki-e/install-action@e75cfd3544e409eb8da0d09dd5d918cd3e6e3982 # just
+
+      # Rewrites [workspace.package].version and the `version` field on every
+      # [workspace.dependencies] entry. cargo-release-oxc can't do this because
+      # it looks up workspace deps by published name, which differs from our
+      # import-name keys (`react_compiler` vs `nextjs_react_compiler`).
+      - name: Bump version via codemod
+        run: just codemod "${{ inputs.version }}"
+
+      - name: Create branch and open PR
+        run: node --experimental-strip-types .github/scripts/bump-version.ts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          ALLOW_EMPTY: ${{ inputs.allow_empty }}
