@@ -48,7 +48,8 @@ jobs:
           BRANCH="release/v${VERSION}"
           git checkout -b "$BRANCH"
           git add -A react-compiler
-          git commit -m "release: bump to ${VERSION}"
+          EMPTY_FLAG=${{ inputs.allow_empty && '--allow-empty' || '' }}
+          git commit $EMPTY_FLAG -m "release: bump to ${VERSION}"
           git push origin "$BRANCH"
           gh pr create \
             --title "release: bump to ${VERSION}" \
