@@ -51,8 +51,12 @@ jobs:
           EMPTY_FLAG=${{ inputs.allow_empty && '--allow-empty' || '' }}
           git commit $EMPTY_FLAG -m "release: bump to ${VERSION}"
           git push origin "$BRANCH"
+          BODY="Version bump via \`cargo release-oxc update\`. Merge this, then run the **Publish Crates** workflow against \`main\`."
+          if [[ "${{ inputs.allow_empty }}" == "true" ]]; then
+            BODY="$BODY"$'\n\n'"**Warning:** created with allow-empty — no files changed. For testing only."
+          fi
           gh pr create \
             --title "release: bump to ${VERSION}" \
-            --body "Version bump via \`cargo release-oxc update\`. Merge this, then run the **Publish Crates** workflow against \`main\`." \
+            --body "$BODY" \
             --base main \
             --head "$BRANCH"
