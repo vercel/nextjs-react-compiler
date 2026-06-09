@@ -1,5 +1,5 @@
 [package]
-name = "forked_react_compiler_ssa"
+name = "nextjs_react_compiler_ssa"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

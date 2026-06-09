@@ -1,8 +1,8 @@
 # This repo vendors the React Compiler (Rust port) from facebook/react PR #36173
 # into ./react-compiler, then (editing only Cargo.toml for crate naming) sets each
-# crate's published name to `forked_react_compiler_*` while keeping the lib/import
+# crate's published name to `nextjs_react_compiler_*` while keeping the lib/import
 # name, source, and directories as upstream's `react_compiler_*`, and adds the
-# metadata + `publish` flags to release `forked_react_compiler` and its deps to crates.io.
+# metadata + `publish` flags to release `nextjs_react_compiler` and its deps to crates.io.
 #
 # The oxc-project org ruleset forbids merge commits, so the vendor is a linear
 # snapshot (not `git subtree`): each `sync` re-extracts upstream's `compiler/`,
@@ -15,7 +15,7 @@
 #   just patch        # apply ./patches/*.patch (Rust source changes the codemod can't express)
 #   just check        # cargo check the vendored workspace
 #   just publish-dry  # dry-run publishing the whole set (cargo publish --workspace --dry-run)
-#   just publish      # publish forked_react_compiler + its deps via cargo-release-oxc
+#   just publish      # publish nextjs_react_compiler + its deps via cargo-release-oxc
 #   just status       # show which upstream commit is currently vendored
 
 react_repo := "https://github.com/facebook/react.git"
@@ -30,7 +30,7 @@ default:
 # One-time import (same operation as sync; kept for discoverability)
 import: sync
 
-# Snapshot react's `compiler/` into ./{{prefix}}, set published names to forked_react_compiler_*, commit once
+# Snapshot react's `compiler/` into ./{{prefix}}, set published names to nextjs_react_compiler_*, commit once
 sync:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -51,7 +51,7 @@ sync:
     if git diff --cached --quiet -- {{prefix}}; then
         echo "{{prefix}} already at react {{pr_ref}} @ ${upstream} — nothing to commit."
     else
-        git commit -q -m "vendor: react-compiler from {{pr_ref}} @ ${upstream} (forked_react_compiler)"
+        git commit -q -m "vendor: react-compiler from {{pr_ref}} @ ${upstream} (nextjs_react_compiler)"
         echo "Committed {{prefix}} @ ${upstream}."
     fi
 
@@ -84,7 +84,7 @@ publish-dry:
 
 # Needs cargo-release-oxc (`cargo install --git https://github.com/oxc-project/cargo-release-oxc`),
 # a clean git tree, and CARGO_REGISTRY_TOKEN.
-# Publish forked_react_compiler + its deps in order, skipping publish=false crates
+# Publish nextjs_react_compiler + its deps in order, skipping publish=false crates
 publish:
     cd {{prefix}} && cargo release-oxc publish --release crates
 
