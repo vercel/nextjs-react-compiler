@@ -196,7 +196,7 @@ fn publish_closure(members: &[Member], internal: &BTreeSet<&str>) -> BTreeSet<St
     }
 
     let mut closure = BTreeSet::new();
-    let mut queue = VecDeque::from(["nextjs_react_compiler".to_string()]);
+    let mut queue = VecDeque::from(["react_compiler".to_string()]);
     while let Some(name) = queue.pop_front() {
         if !closure.insert(name.clone()) {
             continue;
