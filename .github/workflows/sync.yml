@@ -38,7 +38,7 @@ jobs:
           git checkout -b "$BRANCH"
 
       - name: Sync upstream
-        run: just sync
+        run: just pr_ref="${{ inputs.upstream_ref }}" sync
 
       - name: Run codemod
         run: just codemod
@@ -63,7 +63,7 @@ jobs:
           git push origin "$BRANCH"
           UPSTREAM=$(git log -1 --format='%s' | grep -oP '(?<=@ )\S+' || echo "unknown")
           gh pr create \
-            --title "vendor: sync react-compiler from PR #36173" \
-            --body "Automated sync via \`just sync && just codemod\`. Upstream commit: \`${UPSTREAM}\`." \
+            --title "vendor: sync react-compiler upstream" \
+            --body "Automated sync via \`just sync && just codemod\`. Ref: \`${{ inputs.upstream_ref }}\`, upstream commit: \`${UPSTREAM}\`." \
             --base main \
             --head "$BRANCH"
