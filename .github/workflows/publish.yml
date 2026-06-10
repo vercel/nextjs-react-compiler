@@ -22,7 +22,7 @@ jobs:
       - uses: taiki-e/install-action@e75cfd3544e409eb8da0d09dd5d918cd3e6e3982 # just
 
       - name: Install cargo-release-oxc
-        run: cargo install --git https://github.com/oxc-project/cargo-release-oxc
+        run: cargo install --git https://github.com/oxc-project/cargo-release-oxc --rev a9cb052fe19689dc66d35c6ba534e5865de3c406
 
       - name: Publish (dry run)
         if: inputs.dry_run
