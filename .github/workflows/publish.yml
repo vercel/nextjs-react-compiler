@@ -1,0 +1,13 @@
+name: Publish Crates
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Dry run (no actual publish)
+        type: boolean
+        default: true
+jobs:
+  stub:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "stub"

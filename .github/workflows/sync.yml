@@ -1,0 +1,13 @@
+name: Sync React Compiler
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Git ref or commit SHA to sync from (default: tip of pull/36173/head)"
+        type: string
+        default: pull/36173/head
+jobs:
+  stub:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "stub"
