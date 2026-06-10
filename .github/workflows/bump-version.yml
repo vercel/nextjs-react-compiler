@@ -1,0 +1,13 @@
+name: Bump Version
+on:
+  workflow_dispatch:
+    inputs:
+      allow_empty:
+        description: Allow empty commit (useful for testing the workflow)
+        type: boolean
+        default: false
+jobs:
+  stub:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "stub"
