@@ -6,8 +6,47 @@ on:
         description: Allow empty commit (useful for testing the workflow)
         type: boolean
         default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  stub:
+  bump:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "stub"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Install cargo-release-oxc
+        run: cargo install --git https://github.com/oxc-project/cargo-release-oxc --rev a9cb052fe19689dc66d35c6ba534e5865de3c406
+
+      - name: Bump version and generate changelog
+        working-directory: react-compiler
+        run: cargo release-oxc update --release crates
+
+      - name: Read new version
+        id: version
+        run: echo "value=$(cat react-compiler/target/crates_VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Create branch and open PR
+        run: node --experimental-strip-types .github/scripts/bump-version-pr.ts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.value }}
+          ALLOW_EMPTY: ${{ inputs.allow_empty }}

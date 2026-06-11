@@ -1,4 +1,4 @@
-# This repo vendors the React Compiler (Rust port) from facebook/react PR #36173
+# This repo vendors the React Compiler (Rust port) from facebook/react main
 # into ./react-compiler, then (editing only Cargo.toml for crate naming) sets each
 # crate's published name to `nextjs_react_compiler_*` while keeping the lib/import
 # name, source, and directories as upstream's `react_compiler_*`, and adds the
@@ -10,7 +10,7 @@
 # Both are re-applied every sync because the snapshot is taken fresh.
 #
 #   just import       # one-time: create ./react-compiler (transformed)
-#   just sync         # update ./react-compiler to the latest PR state (re-transformed)
+#   just sync         # update ./react-compiler to the latest main state (re-transformed)
 #   just codemod      # (re)run codemod on ./react-compiler in place
 #   just patch        # apply ./patches/*.patch (Rust source changes the codemod can't express)
 #   just check        # cargo check the vendored workspace
@@ -18,10 +18,11 @@
 #   just publish      # publish nextjs_react_compiler + its deps via cargo-release-oxc
 #   just status       # show which upstream commit is currently vendored
 
-react_repo := "https://github.com/facebook/react.git"
-pr_ref     := "pull/36173/head"
-src_dir    := "compiler"          # path of the compiler inside the react monorepo
-prefix     := "react-compiler"    # where it lives in THIS repo
+react_repo    := "https://github.com/facebook/react.git"
+upstream_ref  := "main"
+pr_ref        := upstream_ref
+src_dir       := "compiler"          # path of the compiler inside the react monorepo
+prefix        := "react-compiler"    # where it lives in THIS repo
 
 # Show available recipes
 default:

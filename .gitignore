@@ -5,3 +5,4 @@
 # Build artifacts
 /target/
 /react-compiler/target/
+/node_modules/
