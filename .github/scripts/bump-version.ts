@@ -15,6 +15,14 @@ if (!hasChanges && !allowEmpty) {
   process.exit(1);
 }
 
+// Re-runs (e.g. testing) may leave the branch behind; delete-then-create
+// is simpler than updateRef + force-push and keeps the branch fresh.
+try {
+  await octokit.rest.git.deleteRef({ owner, repo, ref: `heads/${branch}` });
+} catch (err: any) {
+  if (err.status !== 422 && err.status !== 404) throw err;
+}
+
 await octokit.rest.git.createRef({
   owner, repo,
   ref: `refs/heads/${branch}`,
@@ -38,7 +46,7 @@ if (hasChanges) {
   });
 }
 
-let body = 'Version bump via `cargo release-oxc update`. Merge this, then run the **Publish Crates** workflow against `main`.';
+let body = 'Version bump via `just codemod`. Merge this, then run the **Publish Crates** workflow against `main`.';
 if (allowEmpty && !hasChanges) {
   body += '\n\n**Warning:** created with allow-empty — no files changed. For testing only.';
 }
