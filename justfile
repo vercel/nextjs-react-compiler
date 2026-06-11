@@ -1,4 +1,4 @@
-# This repo vendors the React Compiler (Rust port) from facebook/react main
+# This repo vendors the React Compiler (Rust port) from react/react main
 # into ./react-compiler, then (editing only Cargo.toml for crate naming) sets each
 # crate's published name to `nextjs_react_compiler_*` while keeping the lib/import
 # name, source, and directories as upstream's `react_compiler_*`, and adds the
@@ -18,7 +18,7 @@
 #   just publish      # publish nextjs_react_compiler + its deps via cargo-release-oxc
 #   just status       # show which upstream commit is currently vendored
 
-react_repo    := "https://github.com/facebook/react.git"
+react_repo    := "https://github.com/react/react.git"
 upstream_ref  := "main"
 src_dir       := "compiler"          # path of the compiler inside the react monorepo
 prefix        := "react-compiler"    # where it lives in THIS repo
@@ -49,7 +49,7 @@ sync:
     just patch
     git add -A {{prefix}}
     if git diff --cached --quiet -- {{prefix}}; then
-        echo "{{prefix}} already at react {{pr_ref}} @ ${upstream} — nothing to commit."
+        echo "{{prefix}} already at react {{upstream_ref}} @ ${upstream} — nothing to commit."
     else
         git commit -q -m "vendor: react-compiler from {{upstream_ref}} @ ${upstream} (nextjs_react_compiler)"
         echo "Committed {{prefix}} @ ${upstream}."

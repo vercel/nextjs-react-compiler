@@ -18,7 +18,7 @@ export interface FileChanges {
 export function collectFileChanges(dir: string, base: string): FileChanges {
   execSync(`git add -A ${dir}`);
 
-  const diffRaw = execSync(`git diff-index --cached --name-status -z ${base}`).toString();
+  const diffRaw = execSync(`git diff-index --cached --name-status -z ${base} -- ${dir}`).toString();
   const tokens = diffRaw.split('\0');
   const additions: FileAddition[] = [];
   const deletions: FileDeletion[] = [];
