@@ -77,12 +77,8 @@ pub fn transform(
     // This maps source positions to new identifier names for uncompiled code.
     let rename_plan = build_rename_plan(&scope_info, &renames);
 
-    // `compile_program` returns the Babel AST by value — use it directly, no
-    // JSON round-trip.
-    let compiled_file = program_ast;
-
     TransformResult {
-        file: compiled_file,
+        file: program_ast,
         diagnostics,
         events,
         rename_plan,
