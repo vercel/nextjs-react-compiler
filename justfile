@@ -14,7 +14,7 @@
 #   just codemod      # (re)run codemod on ./react-compiler in place
 #   just patch        # apply ./patches/*.patch (Rust source changes the codemod can't express)
 #   just check        # cargo check the vendored workspace
-#   just publish-dry  # dry-run publishing the whole set (cargo publish --workspace --dry-run)
+#   just publish-dry  # dry-run publishing the whole set (cargo release-oxc publish --dry-run)
 #   just publish      # publish nextjs_react_compiler + its deps via cargo-release-oxc
 #   just status       # show which upstream commit is currently vendored
 
@@ -78,9 +78,10 @@ patch:
 check:
     cd {{prefix}} && cargo check --workspace
 
-# Dry-run publishing the whole publishable set (cargo's workspace publish handles inter-crate deps)
+# Dry-run publish — same code path as `publish` but with --dry-run, so failures
+# (publish order, metadata validation, etc.) surface here instead of mid-publish.
 publish-dry:
-    cd {{prefix}} && cargo publish --workspace --dry-run
+    cd {{prefix}} && cargo release-oxc publish --release crates --dry-run
 
 # Needs cargo-release-oxc (`cargo install --git https://github.com/oxc-project/cargo-release-oxc`),
 # a clean git tree, and CARGO_REGISTRY_TOKEN.

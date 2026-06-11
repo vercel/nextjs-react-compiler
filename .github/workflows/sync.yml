@@ -3,11 +3,55 @@ on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: "Git ref or commit SHA to sync from (default: tip of pull/36173/head)"
+        description: "Git ref or commit SHA to sync from react/react (default: main)"
         type: string
-        default: pull/36173/head
+        default: main
+
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  stub:
+  sync:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "stub"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: '.node-version'
+          cache: 'pnpm'
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - uses: taiki-e/install-action@e75cfd3544e409eb8da0d09dd5d918cd3e6e3982 # just
+
+      - name: Configure git identity
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+      - name: Set branch name
+        run: echo "BRANCH=sync/react-compiler-$(date +%Y%m%d-%H%M%S)" >> "$GITHUB_ENV"
+
+      - name: Sync upstream
+        run: just upstream_ref="${{ inputs.upstream_ref }}" sync
+
+      - name: Run codemod
+        run: just codemod
+
+      - name: Create signed commit and open PR
+        run: node --experimental-strip-types .github/scripts/sync-pr.ts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ env.BRANCH }}
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}

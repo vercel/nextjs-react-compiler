@@ -6,8 +6,34 @@ on:
         description: Dry run (no actual publish)
         type: boolean
         default: true
+
 jobs:
-  stub:
+  publish:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for OIDC token exchange with crates.io
     steps:
-      - run: echo "stub"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # No caching in this workflow: a poisoned cache could ship a tampered
+      # binary to crates.io. Builds from scratch every run.
+      - uses: taiki-e/install-action@e75cfd3544e409eb8da0d09dd5d918cd3e6e3982 # just
+
+      - name: Install cargo-release-oxc
+        run: cargo install --locked --git https://github.com/oxc-project/cargo-release-oxc --rev a9cb052fe19689dc66d35c6ba534e5865de3c406
+
+      - name: Publish (dry run)
+        if: inputs.dry_run
+        run: just publish-dry
+
+      - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+        if: ${{ !inputs.dry_run }}
+        id: auth
+
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: just publish
