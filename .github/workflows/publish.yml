@@ -17,20 +17,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
+      # No caching in this workflow: a poisoned cache could ship a tampered
+      # binary to crates.io. Builds from scratch every run.
       - uses: taiki-e/install-action@e75cfd3544e409eb8da0d09dd5d918cd3e6e3982 # just
 
-      - name: Cache cargo-release-oxc
-        id: cache-cargo-release-oxc
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/.cargo/bin/cargo-release-oxc
-          key: cargo-release-oxc-a9cb052fe19689dc66d35c6ba534e5865de3c406
-
       - name: Install cargo-release-oxc
-        if: steps.cache-cargo-release-oxc.outputs.cache-hit != 'true'
-        run: cargo install --git https://github.com/oxc-project/cargo-release-oxc --rev a9cb052fe19689dc66d35c6ba534e5865de3c406
+        run: cargo install --locked --git https://github.com/oxc-project/cargo-release-oxc --rev a9cb052fe19689dc66d35c6ba534e5865de3c406
 
       - name: Publish (dry run)
         if: inputs.dry_run
