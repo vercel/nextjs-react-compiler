@@ -1,6 +1,7 @@
 use react_compiler_ast::expressions::Identifier as AstIdentifier;
 use react_compiler_ast::patterns::PatternLike;
 use react_compiler_ast::statements::BlockStatement;
+use react_compiler_ast::File;
 use react_compiler_diagnostics::SourceLocation;
 use react_compiler_hir::ReactFunctionType;
 use serde::Serialize;
@@ -80,13 +81,13 @@ pub struct BindingRenameInfo {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum CompileResult {
     /// Compilation succeeded (or no functions needed compilation).
-    /// `ast` is None if no changes were made to the program. The compiled Babel
-    /// AST is returned by value so in-process Rust consumers (the oxc/swc
-    /// front-ends) use it directly instead of round-tripping through JSON.
-    /// `CompileResult` still derives `Serialize`, so a JS consumer can serialize
-    /// the whole result as before.
+    /// `ast` is None if no changes were made to the program.
+    /// The compiled Babel AST is returned by value so in-process Rust consumers
+    /// (the oxc/swc frontends) use it directly instead of round-tripping through
+    /// JSON. CompileResult still derives Serialize, so the napi consumer
+    /// serializes the whole result (inlining the File) as before.
     Success {
-        ast: Option<react_compiler_ast::File>,
+        ast: Option<File>,
         events: Vec<LoggerEvent>,
         /// Unified ordered log interleaving events and debug entries.
         /// Items appear in the order they were emitted during compilation.

@@ -91,7 +91,7 @@ pub fn transform(
         react_compiler::entrypoint::program::compile_program(file, scope_info, options);
 
     let diagnostics = compile_result_to_diagnostics(&result);
-    let (program_json, events, renames) = match result {
+    let (program_ast, events, renames) = match result {
         react_compiler::entrypoint::compile_result::CompileResult::Success {
             ast,
             events,
@@ -103,10 +103,9 @@ pub fn transform(
         } => (None, events, Vec::new()),
     };
 
-    // `compile_program` returns the Babel AST by value — convert it directly,
-    // no JSON round-trip.
-    let conversion_result =
-        program_json.map(|file| convert_program_to_swc_with_source(&file, Some(source_text)));
+    let conversion_result = program_ast.map(|file| {
+        convert_program_to_swc_with_source(&file, Some(source_text))
+    });
 
     let (mut swc_module, mut comments) = match conversion_result {
         Some(result) => (Some(result.module), Some(result.comments)),

@@ -43,7 +43,6 @@ use react_compiler_diagnostics::SourceLocation;
 use react_compiler_hir::ReactFunctionType;
 use react_compiler_hir::environment_config::EnvironmentConfig;
 use react_compiler_lowering::FunctionNode;
-use regex::Regex;
 
 use super::compile_result::BindingRenameInfo;
 use super::compile_result::CodegenFunction;
@@ -175,26 +174,21 @@ fn find_directives_dynamic_gating<'a>(
         None => return Ok(None),
     };
 
-    let pattern = Regex::new(r"^use memo if\(([^\)]*)\)$").expect("Invalid dynamic gating regex");
-
     let mut errors: Vec<CompilerErrorDetail> = Vec::new();
     let mut matches: Vec<(&'a Directive, String)> = Vec::new();
 
     for directive in directives {
-        if let Some(caps) = pattern.captures(&directive.value.value) {
-            if let Some(m) = caps.get(1) {
-                let ident = m.as_str();
-                if is_valid_identifier(ident) {
-                    matches.push((directive, ident.to_string()));
-                } else {
-                    let mut detail = CompilerErrorDetail::new(
-                        ErrorCategory::Gating,
-                        "Dynamic gating directive is not a valid JavaScript identifier",
-                    )
-                    .with_description(format!("Found '{}'", directive.value.value));
-                    detail.loc = directive.base.loc.as_ref().map(convert_loc);
-                    errors.push(detail);
-                }
+        if let Some(ident) = parse_dynamic_gating_directive(&directive.value.value) {
+            if is_valid_identifier(ident) {
+                matches.push((directive, ident.to_string()));
+            } else {
+                let mut detail = CompilerErrorDetail::new(
+                    ErrorCategory::Gating,
+                    "Dynamic gating directive is not a valid JavaScript identifier",
+                )
+                .with_description(format!("Found '{}'", directive.value.value));
+                detail.loc = directive.base.loc.as_ref().map(convert_loc);
+                errors.push(detail);
             }
         }
     }
@@ -234,6 +228,20 @@ fn find_directives_dynamic_gating<'a>(
     } else {
         Ok(None)
     }
+}
+
+/// Parse a `use memo if(<condition>)` directive, returning the condition.
+/// Exact equivalent of the TS DYNAMIC_GATING_DIRECTIVE regex
+/// `^use memo if\(([^\)]*)\)$`: the condition may not contain `)` and the
+/// directive must end at the closing paren.
+fn parse_dynamic_gating_directive(value: &str) -> Option<&str> {
+    let condition = value
+        .strip_prefix("use memo if(")?
+        .strip_suffix(')')?;
+    if condition.contains(')') {
+        return None;
+    }
+    Some(condition)
 }
 
 /// Simple check for valid JavaScript identifier (alphanumeric + underscore + $, starting with letter/$/_ )
@@ -782,7 +790,7 @@ fn calls_hooks_or_creates_jsx_in_class_body(
 ) -> bool {
     body.body
         .iter()
-        .any(|member| calls_hooks_or_creates_jsx_in_json(member))
+        .any(|member| calls_hooks_or_creates_jsx_in_json(&member.parse_value()))
 }
 
 fn calls_hooks_or_creates_jsx_in_json(value: &serde_json::Value) -> bool {
@@ -922,11 +930,11 @@ fn calls_hooks_or_creates_jsx_in_pattern(pattern: &PatternLike) -> bool {
 /// Returns false for primitive type annotations that indicate this is NOT a component.
 fn is_valid_props_annotation(param: &PatternLike) -> bool {
     let type_annotation = match param {
-        PatternLike::Identifier(id) => id.type_annotation.as_deref(),
-        PatternLike::ObjectPattern(op) => op.type_annotation.as_deref(),
-        PatternLike::ArrayPattern(ap) => ap.type_annotation.as_deref(),
-        PatternLike::AssignmentPattern(ap) => ap.type_annotation.as_deref(),
-        PatternLike::RestElement(re) => re.type_annotation.as_deref(),
+        PatternLike::Identifier(id) => id.type_annotation.as_ref(),
+        PatternLike::ObjectPattern(op) => op.type_annotation.as_ref(),
+        PatternLike::ArrayPattern(ap) => ap.type_annotation.as_ref(),
+        PatternLike::AssignmentPattern(ap) => ap.type_annotation.as_ref(),
+        PatternLike::RestElement(re) => re.type_annotation.as_ref(),
         PatternLike::MemberExpression(_)
         | PatternLike::TSAsExpression(_)
         | PatternLike::TSSatisfiesExpression(_)
@@ -935,7 +943,7 @@ fn is_valid_props_annotation(param: &PatternLike) -> bool {
         | PatternLike::TypeCastExpression(_) => None,
     };
     let annot = match type_annotation {
-        Some(val) => val,
+        Some(raw) => raw.parse_value(),
         None => return true, // No annotation = valid
     };
     let annot_type = match annot.get("type").and_then(|v| v.as_str()) {
@@ -2173,7 +2181,9 @@ fn stmt_references_identifier_at_top_level(stmt: &Statement, name: &str) -> bool
         // Unmodeled statements (e.g. `export = X`) can reference top-level
         // bindings; scan the raw node for a matching Identifier so the
         // gating reference-before-declaration analysis does not miss them.
-        Statement::Unknown(unknown) => raw_node_references_identifier(unknown.raw(), name),
+        Statement::Unknown(unknown) => {
+            raw_node_references_identifier(&unknown.raw().parse_value(), name)
+        }
         _ => false,
     }
 }
@@ -4014,8 +4024,8 @@ pub fn compile_program(mut file: File, scope: ScopeInfo, options: PluginOptions)
 
     let timing_entries = context.timing.into_entries();
 
-    // Return the compiled Babel AST by value — no JSON round-trip for in-process
-    // Rust consumers (the oxc/swc front-ends deserialized it back immediately).
+    // Return the compiled File by value; in-process Rust consumers use it
+    // directly, and the napi consumer serializes the whole result as before.
     CompileResult::Success {
         ast: Some(file),
         events: context.events,
