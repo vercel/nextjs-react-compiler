@@ -4,5 +4,6 @@
 
 # Build artifacts
 /target/
+/codemod/target/
 /react-compiler/target/
 /node_modules/

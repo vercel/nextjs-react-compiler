@@ -11,7 +11,8 @@
 //!   - inherits version/edition/license/description/repository from `[workspace.package]`
 //!   - internal deps become `{ workspace = true }`
 //!   - any `regex` dep is swapped to a `regex-lite` package rename (import name kept)
-//!   - `publish` = true for `react_compiler` and its (transitive) deps; false for the rest
+//!   - `publish` = true for the publish roots (`react_compiler`, `react_compiler_swc`) and
+//!     their (transitive) deps; false for the rest
 //! Root `[workspace.dependencies]` maps each import name to its published package:
 //!   `react_compiler_X = { package = "nextjs_react_compiler_X", version, path }`
 //!
@@ -30,6 +31,10 @@ const EDITION: &str = "2024";
 const LICENSE: &str = "MIT";
 const DESCRIPTION: &str = "Rust port of the React Compiler, vendored from facebook/react.";
 const REPOSITORY: &str = "https://github.com/vercel/forked-react-compiler";
+/// Crates whose `publish` flag is set to `true` (along with their transitive
+/// internal deps). Everything else gets `publish = false`. Import names (not
+/// published `nextjs_*` names).
+const PUBLISH_ROOTS: &[&str] = &["react_compiler", "react_compiler_swc"];
 /// React's MIT LICENSE, kept as a local copy (`./LICENSE`) and linked into the
 /// tool so syncing needs no network for it.
 const LICENSE_TEXT: &str = include_str!("../../LICENSE");
@@ -176,8 +181,8 @@ fn edit_root_manifest(root: &Path, members: &[Member], version: &str) {
     fs::write(&path, doc.to_string()).expect("write workspace Cargo.toml");
 }
 
-/// Crates reachable from `react_compiler` over internal `[dependencies]` /
-/// `[build-dependencies]` — the set to publish — including `react_compiler` itself.
+/// Crates to publish: the publish roots (`react_compiler`, `react_compiler_swc`) plus
+/// everything reachable from them over internal `[dependencies]` / `[build-dependencies]`.
 fn publish_closure(members: &[Member], internal: &BTreeSet<&str>) -> BTreeSet<String> {
     let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
     for member in members {
@@ -196,7 +201,7 @@ fn publish_closure(members: &[Member], internal: &BTreeSet<&str>) -> BTreeSet<St
     }
 
     let mut closure = BTreeSet::new();
-    let mut queue = VecDeque::from(["react_compiler".to_string()]);
+    let mut queue: VecDeque<_> = PUBLISH_ROOTS.iter().map(|s| s.to_string()).collect();
     while let Some(name) = queue.pop_front() {
         if !closure.insert(name.clone()) {
             continue;
