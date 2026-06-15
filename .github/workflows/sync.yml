@@ -6,6 +6,10 @@ on:
         description: "Git ref or commit SHA to sync from react/react (default: main)"
         type: string
         default: main
+      swc_ref:
+        description: "Git ref or commit SHA to sync from swc-project/swc (default: main)"
+        type: string
+        default: main
 
 permissions:
   contents: write
@@ -43,11 +47,24 @@ jobs:
       - name: Set branch name
         run: echo "BRANCH=sync/react-compiler-$(date +%Y%m%d-%H%M%S)" >> "$GITHUB_ENV"
 
-      - name: Sync upstream
-        run: just upstream_ref="${{ inputs.upstream_ref }}" sync
+      - name: Capture current published version
+        run: echo "VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' react-compiler/Cargo.toml | head -1)" >> "$GITHUB_ENV"
+
+      - name: Sync React compiler crates from react/react
+        run: |
+          just upstream_ref="${{ inputs.upstream_ref }}" sync-react
+          echo "REACT_SHA=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_ENV"  # read by sync-pr.ts
+
+      - name: Sync SWC integration crate from swc-project/swc
+        run: |
+          just swc_ref="${{ inputs.swc_ref }}" sync-swc
+          echo "SWC_SHA=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_ENV"  # read by sync-pr.ts
 
       - name: Run codemod
-        run: just codemod
+        run: just codemod "$VERSION"
+
+      - name: Apply patches
+        run: just patch
 
       - name: Create signed commit and open PR
         run: node --experimental-strip-types .github/scripts/sync-pr.ts
