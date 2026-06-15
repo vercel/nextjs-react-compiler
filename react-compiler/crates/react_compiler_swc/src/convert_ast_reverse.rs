@@ -3,130 +3,542 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Reverse AST converter: react_compiler_ast (Babel format) → SWC AST.
-//!
-//! This is the inverse of `convert_ast.rs`. It takes a `react_compiler_ast::File`
-//! (which represents the compiler's Babel-compatible output) and produces SWC AST
-//! nodes suitable for code generation via `swc_codegen`.
+//! Reverse AST converter: `react_compiler_ast` (Babel format) to SWC AST.
 
-use react_compiler_ast::common::BaseNode;
-use react_compiler_ast::common::Comment as BabelComment;
-use react_compiler_ast::declarations::ExportAllDeclaration;
-use react_compiler_ast::declarations::ExportDefaultDecl as BabelExportDefaultDecl;
-use react_compiler_ast::declarations::ExportDefaultDeclaration;
-use react_compiler_ast::declarations::ExportKind;
-use react_compiler_ast::declarations::ExportNamedDeclaration;
-use react_compiler_ast::declarations::ImportDeclaration;
-use react_compiler_ast::declarations::ImportKind;
-use react_compiler_ast::expressions::Expression as BabelExpr;
-use react_compiler_ast::expressions::{self as babel_expr};
-use react_compiler_ast::operators::*;
-use react_compiler_ast::patterns::*;
-use react_compiler_ast::statements::Statement as BabelStmt;
-use react_compiler_ast::statements::{self as babel_stmt};
+use std::cell::RefCell;
+
+use react_compiler_ast::{
+    common::BaseNode, declarations::*, expressions::*, jsx::*, literals::*, operators::*,
+    patterns::*, statements::*, File,
+};
+use serde_json::Value;
 use swc_atoms::Atom;
-use swc_atoms::Wtf8Atom;
-use swc_common::BytePos;
-use swc_common::DUMMY_SP;
-use swc_common::Span;
-use swc_common::Spanned;
-use swc_common::SyntaxContext;
-use swc_common::comments::Comment as SwcComment;
-use swc_common::comments::CommentKind;
-use swc_common::comments::Comments;
-use swc_common::comments::SingleThreadedComments;
-use swc_ecma_ast::*;
+use swc_common::{BytePos, Span, Spanned, SyntaxContext, DUMMY_SP};
+use swc_ecma_ast as swc;
 
-/// Result of converting a Babel AST back to SWC, including extracted comments.
-pub struct SwcConversionResult {
-    pub module: Module,
-    pub comments: SingleThreadedComments,
-}
+use crate::preserved_ast::PreservedAst;
 
-/// Convert a `react_compiler_ast::File` into an SWC `Module` and extracted comments.
-pub fn convert_program_to_swc(file: &react_compiler_ast::File) -> SwcConversionResult {
-    convert_program_to_swc_with_source(file, None)
-}
-
-/// Convert a `react_compiler_ast::File` into an SWC `Module` and extracted comments.
-/// When `source_text` is provided, type declarations can be extracted from the
-/// original source for perfect fidelity.
-pub fn convert_program_to_swc_with_source(
-    file: &react_compiler_ast::File,
-    source_text: Option<&str>,
-) -> SwcConversionResult {
-    let ctx = ReverseCtx {
-        comments: SingleThreadedComments::default(),
-        source_text: source_text.map(|s| s.to_string()),
-    };
-    let module = ctx.convert_program(&file.program);
-    SwcConversionResult {
-        module,
-        comments: ctx.comments,
-    }
+/// Convert with source text and preserved SWC nodes from the forward pass.
+pub fn convert_program_to_swc(file: &File, preserved_ast: PreservedAst) -> swc::Program {
+    let ctx = ReverseCtx::new(preserved_ast);
+    ctx.convert_program(&file.program)
 }
 
 struct ReverseCtx {
-    comments: SingleThreadedComments,
-    source_text: Option<String>,
+    preserved_ast: RefCell<PreservedAst>,
 }
 
 impl ReverseCtx {
-    /// Convert a BaseNode's start/end to an SWC Span, and extract any comments.
-    fn span(&self, base: &BaseNode) -> Span {
-        let span = match (base.start, base.end) {
-            (Some(start), Some(end)) => Span::new(BytePos(start), BytePos(end)),
-            _ => DUMMY_SP,
-        };
-        self.extract_comments(base, span);
-        span
+    fn new(preserved_ast: PreservedAst) -> Self {
+        Self {
+            preserved_ast: RefCell::new(preserved_ast),
+        }
     }
 
-    /// Convert a BaseNode's start/end to an SWC Span without extracting comments.
-    /// Use this for sub-nodes where comments should not be duplicated.
-    fn span_no_comments(&self, base: &BaseNode) -> Span {
-        match (base.start, base.end) {
-            (Some(start), Some(end)) => Span::new(BytePos(start), BytePos(end)),
+    #[cold]
+    fn span_from_json_value(&self, value: &serde_json::Value) -> Span {
+        let start = json_u64(value, "start");
+        let end = json_u64(value, "end");
+        match (start, end) {
+            (Some(start), Some(end)) => Span::new(BytePos(start as u32), BytePos(end as u32)),
+            (Some(start), None) => Span::new(BytePos(start as u32), BytePos(start as u32)),
             _ => DUMMY_SP,
         }
     }
 
-    /// Convert a Babel comment to an SWC comment.
-    fn convert_babel_comment(babel_comment: &BabelComment) -> SwcComment {
-        let (kind, text) = match babel_comment {
-            BabelComment::CommentBlock(data) => (CommentKind::Block, &data.value),
-            BabelComment::CommentLine(data) => (CommentKind::Line, &data.value),
+    fn any_ts_type(&self, span: Span) -> Box<swc::TsType> {
+        Box::new(swc::TsType::TsKeywordType(swc::TsKeywordType {
+            span,
+            kind: swc::TsKeywordTypeKind::TsAnyKeyword,
+        }))
+    }
+
+    #[cold]
+    fn convert_ts_type_annotation_from_json(
+        &self,
+        value: &serde_json::Value,
+    ) -> Option<Box<swc::TsTypeAnn>> {
+        let ty = if json_type(value) == Some("TSTypeAnnotation") {
+            self.convert_ts_type_from_json(value.get("typeAnnotation")?)?
+        } else {
+            self.convert_ts_type_from_json(value)?
         };
-        SwcComment {
-            kind,
-            span: DUMMY_SP,
-            text: Atom::from(text.as_str()),
+        Some(Box::new(swc::TsTypeAnn {
+            span: self.span_from_json_value(value),
+            type_ann: ty,
+        }))
+    }
+
+    #[cold]
+    fn convert_ts_type_annotation_option(
+        &self,
+        value: Option<&serde_json::Value>,
+    ) -> Option<Box<swc::TsTypeAnn>> {
+        value.and_then(|value| self.convert_ts_type_annotation_from_json(value))
+    }
+
+    #[cold]
+    fn convert_ts_type_from_json(&self, value: &serde_json::Value) -> Option<Box<swc::TsType>> {
+        let span = self.span_from_json_value(value);
+        let type_name = json_type(value)?;
+        if let Some(kind) = ts_keyword_type_kind(type_name) {
+            return Some(Box::new(swc::TsType::TsKeywordType(swc::TsKeywordType {
+                span,
+                kind,
+            })));
+        }
+
+        let ty = match type_name {
+            "TSThisType" => swc::TsType::TsThisType(swc::TsThisType { span }),
+            "TSArrayType" => swc::TsType::TsArrayType(swc::TsArrayType {
+                span,
+                elem_type: self.convert_ts_type_from_json(value.get("elementType")?)?,
+            }),
+            "TSUnionType" => {
+                let types = json_array(value, "types")?
+                    .iter()
+                    .filter_map(|ty| self.convert_ts_type_from_json(ty))
+                    .collect();
+                swc::TsType::TsUnionOrIntersectionType(swc::TsUnionOrIntersectionType::TsUnionType(
+                    swc::TsUnionType { span, types },
+                ))
+            }
+            "TSParenthesizedType" => swc::TsType::TsParenthesizedType(swc::TsParenthesizedType {
+                span,
+                type_ann: self.convert_ts_type_from_json(value.get("typeAnnotation")?)?,
+            }),
+            "TSTypeOperator" => {
+                let op = ts_type_operator_op(json_str(value, "operator")?)?;
+                swc::TsType::TsTypeOperator(swc::TsTypeOperator {
+                    span,
+                    op,
+                    type_ann: self.convert_ts_type_from_json(value.get("typeAnnotation")?)?,
+                })
+            }
+            "TSTypeReference" => swc::TsType::TsTypeRef(swc::TsTypeRef {
+                span,
+                type_name: self.convert_ts_type_name_from_json(value.get("typeName")?)?,
+                type_params: self.convert_ts_type_parameter_instantiation_alias_from_json(value),
+            }),
+            "TSTypeQuery" => swc::TsType::TsTypeQuery(swc::TsTypeQuery {
+                span,
+                expr_name: self
+                    .convert_ts_type_query_expr_name_from_json(value.get("exprName")?)?,
+                type_args: self.convert_ts_type_parameter_instantiation_alias_from_json(value),
+            }),
+            "TSIndexedAccessType" => swc::TsType::TsIndexedAccessType(swc::TsIndexedAccessType {
+                span,
+                readonly: false,
+                obj_type: self.convert_ts_type_from_json(value.get("objectType")?)?,
+                index_type: self.convert_ts_type_from_json(value.get("indexType")?)?,
+            }),
+            "TSLiteralType" => swc::TsType::TsLitType(swc::TsLitType {
+                span,
+                lit: self.convert_ts_literal_from_json(value.get("literal")?)?,
+            }),
+            _ => return None,
+        };
+        Some(Box::new(ty))
+    }
+
+    #[cold]
+    fn convert_ts_type_name_from_json(
+        &self,
+        value: &serde_json::Value,
+    ) -> Option<swc::TsEntityName> {
+        let span = self.span_from_json_value(value);
+        match json_type(value)? {
+            "Identifier" => Some(swc::TsEntityName::Ident(swc::Ident {
+                span,
+                ctxt: SyntaxContext::empty(),
+                sym: Atom::from(json_str(value, "name")?),
+                optional: false,
+            })),
+            "TSQualifiedName" => {
+                let left = self.convert_ts_type_name_from_json(value.get("left")?)?;
+                let right_value = value.get("right")?;
+                let right = swc::IdentName::new(
+                    Atom::from(json_str(right_value, "name")?),
+                    self.span_from_json_value(right_value),
+                );
+                Some(swc::TsEntityName::TsQualifiedName(Box::new(
+                    swc::TsQualifiedName { span, left, right },
+                )))
+            }
+            _ => None,
         }
     }
 
-    /// Extract comments from a BaseNode and register them with the SWC comments store.
-    fn extract_comments(&self, base: &BaseNode, span: Span) {
-        if let Some(ref leading) = base.leading_comments {
-            let pos = span.lo;
-            for c in leading {
-                self.comments
-                    .add_leading(pos, Self::convert_babel_comment(c));
+    #[cold]
+    fn convert_ts_type_query_expr_name_from_json(
+        &self,
+        value: &serde_json::Value,
+    ) -> Option<swc::TsTypeQueryExpr> {
+        Some(swc::TsTypeQueryExpr::TsEntityName(
+            self.convert_ts_type_name_from_json(value)?,
+        ))
+    }
+
+    #[cold]
+    fn convert_ts_type_parameter_instantiation_from_json(
+        &self,
+        value: &serde_json::Value,
+    ) -> Option<Box<swc::TsTypeParamInstantiation>> {
+        let params = json_array(value, "params")?
+            .iter()
+            .filter_map(|ty| self.convert_ts_type_from_json(ty))
+            .collect();
+        Some(Box::new(swc::TsTypeParamInstantiation {
+            span: self.span_from_json_value(value),
+            params,
+        }))
+    }
+
+    #[cold]
+    fn convert_ts_type_parameter_instantiation_option(
+        &self,
+        value: Option<&serde_json::Value>,
+    ) -> Option<Box<swc::TsTypeParamInstantiation>> {
+        value.and_then(|value| self.convert_ts_type_parameter_instantiation_from_json(value))
+    }
+
+    #[cold]
+    fn convert_ts_type_parameter_instantiation_alias_from_json(
+        &self,
+        value: &serde_json::Value,
+    ) -> Option<Box<swc::TsTypeParamInstantiation>> {
+        self.convert_ts_type_parameter_instantiation_option(
+            value
+                .get("typeParameters")
+                .or_else(|| value.get("typeArguments")),
+        )
+    }
+
+    #[cold]
+    fn convert_ts_type_parameter_instantiation_pair(
+        &self,
+        type_parameters: Option<&serde_json::Value>,
+        type_arguments: Option<&serde_json::Value>,
+    ) -> Option<Box<swc::TsTypeParamInstantiation>> {
+        self.convert_ts_type_parameter_instantiation_option(type_parameters.or(type_arguments))
+    }
+
+    #[cold]
+    fn convert_ts_literal_from_json(&self, value: &serde_json::Value) -> Option<swc::TsLit> {
+        let span = self.span_from_json_value(value);
+        match json_type(value)? {
+            "BooleanLiteral" => Some(swc::TsLit::Bool(swc::Bool {
+                span,
+                value: json_bool(value, "value")?,
+            })),
+            "NumericLiteral" => Some(swc::TsLit::Number(swc::Number {
+                span,
+                value: json_f64(value, "value")?,
+                raw: None,
+            })),
+            "StringLiteral" => Some(swc::TsLit::Str(swc::Str {
+                span,
+                value: json_str(value, "value")?.into(),
+                raw: None,
+            })),
+            "BigIntLiteral" => {
+                let value = json_str(value, "value")?;
+                Some(swc::TsLit::BigInt(swc::BigInt {
+                    span,
+                    value: Box::new(bigint_literal_value(value).parse().ok()?),
+                    raw: Some(bigint_literal_raw(value)),
+                }))
+            }
+            _ => None,
+        }
+    }
+
+    // JSON reconstruction is only a fidelity fallback when no preserved SWC
+    // shell is available for TypeScript metadata.
+    #[cold]
+    fn cold_fill_ts_as_expr_from_json(
+        &self,
+        expr: &mut swc::TsAsExpr,
+        type_annotation: &serde_json::Value,
+        fallback_span: Span,
+    ) {
+        expr.type_ann = self
+            .convert_ts_type_from_json(type_annotation)
+            .unwrap_or_else(|| self.any_ts_type(fallback_span));
+    }
+
+    #[cold]
+    fn cold_fill_ts_satisfies_expr_from_json(
+        &self,
+        expr: &mut swc::TsSatisfiesExpr,
+        type_annotation: &serde_json::Value,
+        fallback_span: Span,
+    ) {
+        expr.type_ann = self
+            .convert_ts_type_from_json(type_annotation)
+            .unwrap_or_else(|| self.any_ts_type(fallback_span));
+    }
+
+    #[cold]
+    fn cold_fill_ts_type_assertion_from_json(
+        &self,
+        expr: &mut swc::TsTypeAssertion,
+        type_annotation: &serde_json::Value,
+        fallback_span: Span,
+    ) {
+        expr.type_ann = self
+            .convert_ts_type_from_json(type_annotation)
+            .unwrap_or_else(|| self.any_ts_type(fallback_span));
+    }
+
+    #[cold]
+    fn cold_fill_ts_instantiation_from_json(
+        &self,
+        expr: &mut swc::TsInstantiation,
+        type_parameters: &serde_json::Value,
+        fallback_span: Span,
+    ) {
+        expr.type_args = self
+            .convert_ts_type_parameter_instantiation_from_json(type_parameters)
+            .unwrap_or_else(|| {
+                Box::new(swc::TsTypeParamInstantiation {
+                    span: fallback_span,
+                    params: vec![],
+                })
+            });
+    }
+
+    #[cold]
+    fn cold_fill_call_type_args_from_json(
+        &self,
+        call: &mut swc::CallExpr,
+        type_parameters: Option<&serde_json::Value>,
+        type_arguments: Option<&serde_json::Value>,
+    ) {
+        call.type_args =
+            self.convert_ts_type_parameter_instantiation_pair(type_parameters, type_arguments);
+    }
+
+    #[cold]
+    fn cold_fill_opt_call_type_args_from_json(
+        &self,
+        call: &mut swc::OptCall,
+        type_parameters: Option<&serde_json::Value>,
+        type_arguments: Option<&serde_json::Value>,
+    ) {
+        call.type_args =
+            self.convert_ts_type_parameter_instantiation_pair(type_parameters, type_arguments);
+    }
+
+    #[cold]
+    fn cold_fill_new_type_args_from_json(
+        &self,
+        expr: &mut swc::NewExpr,
+        type_parameters: Option<&serde_json::Value>,
+        type_arguments: Option<&serde_json::Value>,
+    ) {
+        expr.type_args =
+            self.convert_ts_type_parameter_instantiation_pair(type_parameters, type_arguments);
+    }
+
+    #[cold]
+    fn cold_fill_tagged_tpl_type_params_from_json(
+        &self,
+        tpl: &mut swc::TaggedTpl,
+        type_parameters: Option<&serde_json::Value>,
+    ) {
+        tpl.type_params = self.convert_ts_type_parameter_instantiation_option(type_parameters);
+    }
+
+    #[cold]
+    fn cold_fill_jsx_opening_type_args_from_json(
+        &self,
+        opening: &mut swc::JSXOpeningElement,
+        type_parameters: Option<&serde_json::Value>,
+    ) {
+        opening.type_args = self.convert_ts_type_parameter_instantiation_option(type_parameters);
+    }
+
+    #[cold]
+    fn cold_fill_function_types_from_json(
+        &self,
+        function: &mut swc::Function,
+        params: &[PatternLike],
+        return_type: Option<&serde_json::Value>,
+    ) {
+        function.params = params
+            .iter()
+            .map(|param| self.convert_pattern_like_as_formal_parameter(param))
+            .collect();
+        function.return_type = self.convert_ts_type_annotation_option(return_type);
+    }
+
+    #[cold]
+    fn cold_fill_arrow_types_from_json(
+        &self,
+        arrow: &mut swc::ArrowExpr,
+        params: &[PatternLike],
+        return_type: Option<&serde_json::Value>,
+    ) {
+        arrow.params = params
+            .iter()
+            .map(|param| self.convert_pattern_like(param))
+            .collect();
+        arrow.return_type = self.convert_ts_type_annotation_option(return_type);
+    }
+
+    #[cold]
+    fn cold_fill_var_decl_types_from_json(
+        &self,
+        decl: &mut swc::VarDecl,
+        declarations: &[VariableDeclarator],
+    ) {
+        for (decl, source) in decl.decls.iter_mut().zip(declarations) {
+            decl.name = self.convert_pattern_like(&source.id);
+        }
+    }
+
+    #[cold]
+    fn cold_fill_ts_type_alias_from_json(
+        &self,
+        decl: &mut swc::TsTypeAliasDecl,
+        type_annotation: &serde_json::Value,
+        fallback_span: Span,
+    ) {
+        decl.type_ann = self
+            .convert_ts_type_from_json(type_annotation)
+            .unwrap_or_else(|| self.any_ts_type(fallback_span));
+    }
+
+    fn has_type_args(
+        type_parameters: Option<&serde_json::Value>,
+        type_arguments: Option<&serde_json::Value>,
+    ) -> bool {
+        type_parameters.is_some() || type_arguments.is_some()
+    }
+
+    fn has_type_annotation(value: Option<&serde_json::Value>) -> bool {
+        value.is_some()
+    }
+
+    fn patterns_have_type_annotations(params: &[PatternLike]) -> bool {
+        params.iter().any(Self::pattern_has_type_annotation)
+    }
+
+    fn variable_declarations_have_type_annotations(declarations: &[VariableDeclarator]) -> bool {
+        declarations
+            .iter()
+            .any(|declarator| Self::pattern_has_type_annotation(&declarator.id))
+    }
+
+    fn pattern_has_type_annotation(pattern: &PatternLike) -> bool {
+        match pattern {
+            PatternLike::Identifier(pattern) => pattern.type_annotation.is_some(),
+            PatternLike::ObjectPattern(pattern) => {
+                pattern.type_annotation.is_some()
+                    || pattern
+                        .properties
+                        .iter()
+                        .any(Self::object_pattern_property_has_type_annotation)
+            }
+            PatternLike::ArrayPattern(pattern) => {
+                pattern.type_annotation.is_some()
+                    || pattern
+                        .elements
+                        .iter()
+                        .flatten()
+                        .any(Self::pattern_has_type_annotation)
+            }
+            PatternLike::AssignmentPattern(pattern) => {
+                pattern.type_annotation.is_some()
+                    || Self::pattern_has_type_annotation(&pattern.left)
+            }
+            PatternLike::RestElement(pattern) => {
+                pattern.type_annotation.is_some()
+                    || Self::pattern_has_type_annotation(&pattern.argument)
+            }
+            PatternLike::TSAsExpression(_)
+            | PatternLike::TSSatisfiesExpression(_)
+            | PatternLike::TSTypeAssertion(_)
+            | PatternLike::TypeCastExpression(_) => true,
+            PatternLike::TSNonNullExpression(pattern) => {
+                Self::expression_has_type_annotation(&pattern.expression)
+            }
+            PatternLike::MemberExpression(_) => false,
+        }
+    }
+
+    fn object_pattern_property_has_type_annotation(prop: &ObjectPatternProperty) -> bool {
+        match prop {
+            ObjectPatternProperty::ObjectProperty(prop) => {
+                Self::pattern_has_type_annotation(&prop.value)
+            }
+            ObjectPatternProperty::RestElement(rest) => {
+                rest.type_annotation.is_some() || Self::pattern_has_type_annotation(&rest.argument)
             }
         }
-        if let Some(ref trailing) = base.trailing_comments {
-            let pos = span.hi;
-            for c in trailing {
-                self.comments
-                    .add_trailing(pos, Self::convert_babel_comment(c));
+    }
+
+    fn expression_has_type_annotation(expr: &Expression) -> bool {
+        match expr {
+            Expression::TSAsExpression(_)
+            | Expression::TSSatisfiesExpression(_)
+            | Expression::TSTypeAssertion(_)
+            | Expression::TSInstantiationExpression(_)
+            | Expression::TypeCastExpression(_) => true,
+            Expression::TSNonNullExpression(expr) => {
+                Self::expression_has_type_annotation(expr.expression.as_ref())
             }
+            _ => false,
         }
-        if let Some(ref inner) = base.inner_comments {
-            // Inner comments are typically leading comments of the next token
-            let pos = span.lo;
-            for c in inner {
-                self.comments
-                    .add_leading(pos, Self::convert_babel_comment(c));
-            }
+    }
+
+    fn expression_base(expr: &Expression) -> Option<&BaseNode> {
+        match expr {
+            Expression::Identifier(expr) => Some(&expr.base),
+            Expression::StringLiteral(expr) => Some(&expr.base),
+            Expression::NumericLiteral(expr) => Some(&expr.base),
+            Expression::BooleanLiteral(expr) => Some(&expr.base),
+            Expression::NullLiteral(expr) => Some(&expr.base),
+            Expression::BigIntLiteral(expr) => Some(&expr.base),
+            Expression::RegExpLiteral(expr) => Some(&expr.base),
+            Expression::CallExpression(expr) => Some(&expr.base),
+            Expression::MemberExpression(expr) => Some(&expr.base),
+            Expression::OptionalCallExpression(expr) => Some(&expr.base),
+            Expression::OptionalMemberExpression(expr) => Some(&expr.base),
+            Expression::BinaryExpression(expr) => Some(&expr.base),
+            Expression::LogicalExpression(expr) => Some(&expr.base),
+            Expression::UnaryExpression(expr) => Some(&expr.base),
+            Expression::UpdateExpression(expr) => Some(&expr.base),
+            Expression::ConditionalExpression(expr) => Some(&expr.base),
+            Expression::AssignmentExpression(expr) => Some(&expr.base),
+            Expression::SequenceExpression(expr) => Some(&expr.base),
+            Expression::ArrowFunctionExpression(expr) => Some(&expr.base),
+            Expression::FunctionExpression(expr) => Some(&expr.base),
+            Expression::ObjectExpression(expr) => Some(&expr.base),
+            Expression::ArrayExpression(expr) => Some(&expr.base),
+            Expression::NewExpression(expr) => Some(&expr.base),
+            Expression::TemplateLiteral(expr) => Some(&expr.base),
+            Expression::TaggedTemplateExpression(expr) => Some(&expr.base),
+            Expression::AwaitExpression(expr) => Some(&expr.base),
+            Expression::YieldExpression(expr) => Some(&expr.base),
+            Expression::SpreadElement(expr) => Some(&expr.base),
+            Expression::MetaProperty(expr) => Some(&expr.base),
+            Expression::ClassExpression(expr) => Some(&expr.base),
+            Expression::PrivateName(expr) => Some(&expr.base),
+            Expression::Super(expr) => Some(&expr.base),
+            Expression::Import(expr) => Some(&expr.base),
+            Expression::ThisExpression(expr) => Some(&expr.base),
+            Expression::ParenthesizedExpression(expr) => Some(&expr.base),
+            Expression::JSXElement(expr) => Some(&expr.base),
+            Expression::JSXFragment(expr) => Some(&expr.base),
+            Expression::AssignmentPattern(expr) => Some(&expr.base),
+            Expression::TSAsExpression(expr) => Some(&expr.base),
+            Expression::TSSatisfiesExpression(expr) => Some(&expr.base),
+            Expression::TSNonNullExpression(expr) => Some(&expr.base),
+            Expression::TSTypeAssertion(expr) => Some(&expr.base),
+            Expression::TSInstantiationExpression(expr) => Some(&expr.base),
+            Expression::TypeCastExpression(expr) => Some(&expr.base),
         }
     }
 
@@ -134,1382 +546,1182 @@ impl ReverseCtx {
         Atom::from(s)
     }
 
-    fn wtf8(&self, s: &str) -> Wtf8Atom {
-        Wtf8Atom::from(s)
-    }
-
-    /// Escape non-ASCII characters and special characters (like tab) in a string
-    /// value to \uXXXX or \xXX sequences, matching Babel's codegen output.
-    /// Returns the raw string representation wrapped in double quotes.
-    fn escape_string_raw(&self, value: &str) -> Option<Atom> {
-        let mut needs_escape = false;
-        for ch in value.chars() {
-            if !ch.is_ascii() || ch == '\t' || ch == '\'' || ch == '"' || ch == '\\' {
-                needs_escape = true;
-                break;
-            }
-        }
-        if !needs_escape {
-            return None;
-        }
-        let mut escaped = String::with_capacity(value.len() + 16);
-        escaped.push('"');
-        for ch in value.chars() {
-            match ch {
-                '"' => escaped.push_str("\\\""),
-                '\\' => escaped.push_str("\\\\"),
-                '\n' => escaped.push_str("\\n"),
-                '\r' => escaped.push_str("\\r"),
-                '\t' => escaped.push_str("\\t"),
-                c if !c.is_ascii() => {
-                    // Encode using \uXXXX (or surrogate pairs for chars > U+FFFF)
-                    let mut buf = [0u16; 2];
-                    let encoded = c.encode_utf16(&mut buf);
-                    for unit in encoded {
-                        escaped.push_str(&format!("\\u{:04X}", unit));
-                    }
-                }
-                c => escaped.push(c),
-            }
-        }
-        escaped.push('"');
-        Some(Atom::from(escaped.as_str()))
-    }
-
-    /// Extract the original source text for a node and re-parse it as a
-    /// statement using SWC's TypeScript parser. This is used for type
-    /// declarations (type aliases, interfaces, enums) that the compiler
-    /// preserves verbatim from the original source.
-    fn extract_source_stmt(&self, base: &react_compiler_ast::common::BaseNode) -> Option<Stmt> {
-        let source = self.source_text.as_deref()?;
-        let start = base.start? as usize;
-        let end = base.end? as usize;
-        // SWC BytePos is 1-based
-        let start_idx = start.saturating_sub(1);
-        let end_idx = end.saturating_sub(1);
-        if start_idx >= source.len() || end_idx > source.len() || start_idx >= end_idx {
-            return None;
-        }
-        let text = &source[start_idx..end_idx];
-        self.parse_ts_stmt(text, base)
-    }
-
-    /// Parse a string as a TypeScript statement using SWC's parser.
-    fn parse_ts_stmt(
-        &self,
-        text: &str,
-        base: &react_compiler_ast::common::BaseNode,
-    ) -> Option<Stmt> {
-        let cm = swc_common::sync::Lrc::new(swc_common::SourceMap::default());
-        let fm = cm.new_source_file(
-            swc_common::sync::Lrc::new(swc_common::FileName::Anon),
-            text.to_string(),
-        );
-        let mut errors = vec![];
-        let module = swc_ecma_parser::parse_file_as_module(
-            &fm,
-            swc_ecma_parser::Syntax::Typescript(swc_ecma_parser::TsSyntax {
-                tsx: true,
-                ..Default::default()
-            }),
-            swc_ecma_ast::EsVersion::latest(),
-            None,
-            &mut errors,
-        )
-        .ok()?;
-
-        if let Some(item) = module.body.into_iter().next() {
-            match item {
-                ModuleItem::Stmt(stmt) => {
-                    // Assign the original span so blank line computation works
-                    let span = self.span(base);
-                    return Some(self.assign_span_to_stmt(stmt, span));
-                }
-                ModuleItem::ModuleDecl(_) => {}
-            }
-        }
-        None
-    }
-
-    /// Assign a span to a statement's outermost node.
-    fn assign_span_to_stmt(&self, stmt: Stmt, span: Span) -> Stmt {
-        match stmt {
-            Stmt::Decl(Decl::TsTypeAlias(mut d)) => {
-                d.span = span;
-                Stmt::Decl(Decl::TsTypeAlias(d))
-            }
-            Stmt::Decl(Decl::TsInterface(mut d)) => {
-                d.span = span;
-                Stmt::Decl(Decl::TsInterface(d))
-            }
-            Stmt::Decl(Decl::TsEnum(mut d)) => {
-                d.span = span;
-                Stmt::Decl(Decl::TsEnum(d))
-            }
-            other => other,
-        }
-    }
-
-    fn ident(&self, name: &str, span: Span) -> Ident {
-        Ident {
-            sym: self.atom(name),
-            span,
-            ctxt: SyntaxContext::empty(),
-            optional: false,
-        }
-    }
-
-    fn ident_name(&self, name: &str, span: Span) -> IdentName {
-        IdentName {
-            sym: self.atom(name),
-            span,
-        }
-    }
-
-    fn binding_ident(&self, name: &str, span: Span) -> BindingIdent {
-        BindingIdent {
-            id: self.ident(name, span),
-            type_ann: None,
+    fn span_from_base(&self, base: &BaseNode) -> Span {
+        match (base.start, base.end) {
+            (Some(start), Some(end)) => Span::new(BytePos(start), BytePos(end)),
+            (Some(start), None) => Span::new(BytePos(start), BytePos(start)),
+            _ => DUMMY_SP,
         }
     }
 
     // ===== Program =====
 
-    fn convert_program(&self, program: &react_compiler_ast::Program) -> Module {
-        let mut body: Vec<ModuleItem> = Vec::new();
+    fn convert_program(&self, program: &react_compiler_ast::Program) -> swc::Program {
+        let mut body = self.convert_statement_list_with_spans(&program.body);
+        let directives = self.convert_directive_list(&program.directives);
+        if !directives.is_empty() {
+            body.splice(0..0, directives);
+        }
+        let span = self.span_from_base(&program.base);
+        let shebang = program
+            .interpreter
+            .as_ref()
+            .map(|interpreter| Atom::from(interpreter.value.as_str()));
 
-        // Convert directives to expression statements at the beginning
-        for dir in &program.directives {
-            let span = self.span(&dir.base);
-            let str_span = self.span(&dir.value.base);
-            body.push(ModuleItem::Stmt(Stmt::Expr(ExprStmt {
+        match program.source_type {
+            react_compiler_ast::SourceType::Module => swc::Program::Module(swc::Module {
                 span,
-                expr: Box::new(Expr::Lit(Lit::Str(Str {
-                    span: str_span,
-                    value: self.wtf8(&dir.value.value),
-                    raw: None,
-                }))),
-            })));
-        }
-
-        for s in &program.body {
-            body.push(self.convert_statement_to_module_item(s));
-        }
-
-        Module {
-            span: DUMMY_SP,
-            body,
-            shebang: None,
-        }
-    }
-
-    fn convert_statement_to_module_item(&self, stmt: &BabelStmt) -> ModuleItem {
-        match stmt {
-            BabelStmt::ImportDeclaration(d) => {
-                ModuleItem::ModuleDecl(ModuleDecl::Import(self.convert_import_declaration(d)))
-            }
-            BabelStmt::ExportNamedDeclaration(d) => self.convert_export_named_to_module_item(d),
-            BabelStmt::ExportDefaultDeclaration(d) => self.convert_export_default_to_module_item(d),
-            BabelStmt::ExportAllDeclaration(d) => ModuleItem::ModuleDecl(ModuleDecl::ExportAll(
-                self.convert_export_all_declaration(d),
-            )),
-            // The preserved TS module-interop statements are module
-            // declarations in swc, which `convert_statement` (returning
-            // `Stmt`) cannot represent, so they are rebuilt here.
-            BabelStmt::Unknown(unknown) => match self.convert_unknown_to_module_decl(unknown) {
-                Some(decl) => ModuleItem::ModuleDecl(decl),
-                None => ModuleItem::Stmt(self.convert_statement(stmt)),
-            },
-            _ => ModuleItem::Stmt(self.convert_statement(stmt)),
-        }
-    }
-
-    /// Rebuild the TS module-interop statements carried as raw
-    /// [`BabelStmt::Unknown`] nodes. `None` (other node types, malformed raw
-    /// JSON) routes the caller to the runtime-throw tripwire; silently
-    /// dropping the statement is the failure mode this path exists to avoid.
-    fn convert_unknown_to_module_decl(
-        &self,
-        unknown: &babel_stmt::UnknownStatement,
-    ) -> Option<ModuleDecl> {
-        let raw = unknown.raw().parse_value();
-        let raw = &raw;
-        match unknown.node_type() {
-            "TSImportEqualsDeclaration" => {
-                let id = self.ident_from_raw(raw.get("id")?)?;
-                let module_ref = self.ts_module_ref_from_raw(raw.get("moduleReference")?)?;
-                // Some Babel versions omit `importKind` for value imports,
-                // so an absent key defaults to value.
-                let is_type_only = match raw.get("importKind") {
-                    None => false,
-                    Some(kind) => match kind.as_str() {
-                        Some("type") => true,
-                        Some("value") => false,
-                        _ => return None,
-                    },
-                };
-                let is_export = match raw.get("isExport") {
-                    None => false,
-                    Some(value) => value.as_bool()?,
-                };
-                Some(ModuleDecl::TsImportEquals(Box::new(TsImportEqualsDecl {
-                    span: self.span(unknown.base()),
-                    is_export,
-                    is_type_only,
-                    id,
-                    module_ref,
-                })))
-            }
-            "TSExportAssignment" => {
-                let expr: BabelExpr =
-                    serde_json::from_value(raw.get("expression")?.clone()).ok()?;
-                Some(ModuleDecl::TsExportAssignment(TsExportAssignment {
-                    span: self.span(unknown.base()),
-                    expr: Box::new(self.convert_expression(&expr)),
-                }))
-            }
-            "TSNamespaceExportDeclaration" => {
-                let id = self.ident_from_raw(raw.get("id")?)?;
-                Some(ModuleDecl::TsNamespaceExport(TsNamespaceExportDecl {
-                    span: self.span(unknown.base()),
-                    id,
-                }))
-            }
-            _ => None,
-        }
-    }
-
-    fn ident_from_raw(&self, raw: &serde_json::Value) -> Option<Ident> {
-        if raw.get("type").and_then(serde_json::Value::as_str) != Some("Identifier") {
-            return None;
-        }
-        let id: babel_expr::Identifier = serde_json::from_value(raw.clone()).ok()?;
-        Some(self.ident(&id.name, self.span_no_comments(&id.base)))
-    }
-
-    fn ts_module_ref_from_raw(&self, raw: &serde_json::Value) -> Option<TsModuleRef> {
-        match raw.get("type").and_then(serde_json::Value::as_str)? {
-            "TSExternalModuleReference" => {
-                let expr = raw.get("expression")?;
-                if expr.get("type").and_then(serde_json::Value::as_str) != Some("StringLiteral") {
-                    return None;
-                }
-                let lit: react_compiler_ast::literals::StringLiteral =
-                    serde_json::from_value(expr.clone()).ok()?;
-                let ref_base: BaseNode = serde_json::from_value(raw.clone()).ok()?;
-                Some(TsModuleRef::TsExternalModuleRef(TsExternalModuleRef {
-                    span: self.span_no_comments(&ref_base),
-                    expr: Str {
-                        span: self.span_no_comments(&lit.base),
-                        value: self.wtf8(&lit.value),
-                        raw: None,
-                    },
-                }))
-            }
-            "TSQualifiedName" | "Identifier" => self
-                .ts_entity_name_from_raw(raw)
-                .map(TsModuleRef::TsEntityName),
-            _ => None,
-        }
-    }
-
-    fn ts_entity_name_from_raw(&self, raw: &serde_json::Value) -> Option<TsEntityName> {
-        match raw.get("type").and_then(serde_json::Value::as_str)? {
-            "Identifier" => self.ident_from_raw(raw).map(TsEntityName::Ident),
-            "TSQualifiedName" => {
-                let base: BaseNode = serde_json::from_value(raw.clone()).ok()?;
-                let left = self.ts_entity_name_from_raw(raw.get("left")?)?;
-                let right: babel_expr::Identifier =
-                    serde_json::from_value(raw.get("right")?.clone()).ok()?;
-                Some(TsEntityName::TsQualifiedName(Box::new(TsQualifiedName {
-                    span: self.span_no_comments(&base),
-                    left,
-                    right: self.ident_name(&right.name, self.span_no_comments(&right.base)),
-                })))
-            }
-            _ => None,
-        }
-    }
-
-    // ===== Statements =====
-
-    fn convert_statement(&self, stmt: &BabelStmt) -> Stmt {
-        match stmt {
-            BabelStmt::BlockStatement(s) => Stmt::Block(self.convert_block_statement(s)),
-            BabelStmt::ReturnStatement(s) => Stmt::Return(ReturnStmt {
-                span: self.span(&s.base),
-                arg: s
-                    .argument
-                    .as_ref()
-                    .map(|a| Box::new(self.convert_expression(a))),
+                body,
+                shebang,
             }),
-            BabelStmt::ExpressionStatement(s) => {
-                let expr = self.convert_expression(&s.expression);
-                // Wrap in parens if the expression starts with `{` (object pattern
-                // in assignment) or `function` (IIFE), which would be ambiguous
-                // with a block statement or function declaration.
-                let needs_paren = match &expr {
-                    Expr::Assign(a) => {
-                        matches!(&a.left, AssignTarget::Pat(AssignTargetPat::Object(_)))
-                    }
-                    Expr::Call(c) => match &c.callee {
-                        Callee::Expr(e) => matches!(e.as_ref(), Expr::Fn(_)),
-                        _ => false,
-                    },
-                    _ => false,
-                };
-                let expr = if needs_paren {
-                    Expr::Paren(ParenExpr {
-                        span: self.span_no_comments(&s.base),
-                        expr: Box::new(expr),
-                    })
-                } else {
-                    expr
-                };
-                Stmt::Expr(ExprStmt {
-                    span: self.span(&s.base),
-                    expr: Box::new(expr),
-                })
-            }
-            BabelStmt::IfStatement(s) => Stmt::If(IfStmt {
-                span: self.span(&s.base),
-                test: Box::new(self.convert_expression(&s.test)),
-                cons: Box::new(self.convert_statement(&s.consequent)),
-                alt: s
-                    .alternate
-                    .as_ref()
-                    .map(|a| Box::new(self.convert_statement(a))),
-            }),
-            BabelStmt::ForStatement(s) => {
-                let init = s.init.as_ref().map(|i| self.convert_for_init(i));
-                let test = s
-                    .test
-                    .as_ref()
-                    .map(|t| Box::new(self.convert_expression(t)));
-                let update = s
-                    .update
-                    .as_ref()
-                    .map(|u| Box::new(self.convert_expression(u)));
-                let body = Box::new(self.convert_statement(&s.body));
-                Stmt::For(ForStmt {
-                    span: self.span(&s.base),
-                    init,
-                    test,
-                    update,
-                    body,
-                })
-            }
-            BabelStmt::WhileStatement(s) => Stmt::While(WhileStmt {
-                span: self.span(&s.base),
-                test: Box::new(self.convert_expression(&s.test)),
-                body: Box::new(self.convert_statement(&s.body)),
-            }),
-            BabelStmt::DoWhileStatement(s) => Stmt::DoWhile(DoWhileStmt {
-                span: self.span(&s.base),
-                test: Box::new(self.convert_expression(&s.test)),
-                body: Box::new(self.convert_statement(&s.body)),
-            }),
-            BabelStmt::ForInStatement(s) => Stmt::ForIn(ForInStmt {
-                span: self.span(&s.base),
-                left: self.convert_for_in_of_left(&s.left),
-                right: Box::new(self.convert_expression(&s.right)),
-                body: Box::new(self.convert_statement(&s.body)),
-            }),
-            BabelStmt::ForOfStatement(s) => Stmt::ForOf(ForOfStmt {
-                span: self.span(&s.base),
-                is_await: s.is_await,
-                left: self.convert_for_in_of_left(&s.left),
-                right: Box::new(self.convert_expression(&s.right)),
-                body: Box::new(self.convert_statement(&s.body)),
-            }),
-            BabelStmt::SwitchStatement(s) => {
-                let cases = s
-                    .cases
-                    .iter()
-                    .map(|c| SwitchCase {
-                        span: self.span(&c.base),
-                        test: c
-                            .test
-                            .as_ref()
-                            .map(|t| Box::new(self.convert_expression(t))),
-                        cons: c
-                            .consequent
-                            .iter()
-                            .map(|s| self.convert_statement(s))
-                            .collect(),
+            react_compiler_ast::SourceType::Script => {
+                let body = body
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        swc::ModuleItem::Stmt(stmt) => Some(stmt),
+                        swc::ModuleItem::ModuleDecl(_) => None,
                     })
                     .collect();
-                Stmt::Switch(SwitchStmt {
-                    span: self.span(&s.base),
-                    discriminant: Box::new(self.convert_expression(&s.discriminant)),
-                    cases,
-                })
-            }
-            BabelStmt::ThrowStatement(s) => Stmt::Throw(ThrowStmt {
-                span: self.span(&s.base),
-                arg: Box::new(self.convert_expression(&s.argument)),
-            }),
-            BabelStmt::TryStatement(s) => {
-                let block = self.convert_block_statement(&s.block);
-                let handler = s.handler.as_ref().map(|h| self.convert_catch_clause(h));
-                let finalizer = s
-                    .finalizer
-                    .as_ref()
-                    .map(|f| self.convert_block_statement(f));
-                Stmt::Try(Box::new(TryStmt {
-                    span: self.span(&s.base),
-                    block,
-                    handler,
-                    finalizer,
-                }))
-            }
-            BabelStmt::BreakStatement(s) => Stmt::Break(BreakStmt {
-                span: self.span(&s.base),
-                label: s.label.as_ref().map(|l| self.ident(&l.name, DUMMY_SP)),
-            }),
-            BabelStmt::ContinueStatement(s) => Stmt::Continue(ContinueStmt {
-                span: self.span(&s.base),
-                label: s.label.as_ref().map(|l| self.ident(&l.name, DUMMY_SP)),
-            }),
-            BabelStmt::LabeledStatement(s) => Stmt::Labeled(LabeledStmt {
-                span: self.span(&s.base),
-                label: self.ident(&s.label.name, DUMMY_SP),
-                body: Box::new(self.convert_statement(&s.body)),
-            }),
-            BabelStmt::EmptyStatement(s) => Stmt::Empty(EmptyStmt {
-                span: self.span(&s.base),
-            }),
-            BabelStmt::DebuggerStatement(s) => Stmt::Debugger(DebuggerStmt {
-                span: self.span(&s.base),
-            }),
-            BabelStmt::WithStatement(s) => Stmt::With(WithStmt {
-                span: self.span(&s.base),
-                obj: Box::new(self.convert_expression(&s.object)),
-                body: Box::new(self.convert_statement(&s.body)),
-            }),
-            BabelStmt::VariableDeclaration(d) => {
-                Stmt::Decl(Decl::Var(Box::new(self.convert_variable_declaration(d))))
-            }
-            BabelStmt::FunctionDeclaration(f) => {
-                Stmt::Decl(Decl::Fn(self.convert_function_declaration(f)))
-            }
-            BabelStmt::ClassDeclaration(c) => {
-                let ident =
-                    c.id.as_ref()
-                        .map(|id| self.ident(&id.name, self.span(&id.base)))
-                        .unwrap_or_else(|| self.ident("_anonymous", DUMMY_SP));
-                let super_class = c
-                    .super_class
-                    .as_ref()
-                    .map(|s| Box::new(self.convert_expression(s)));
-                Stmt::Decl(Decl::Class(ClassDecl {
-                    ident,
-                    declare: c.declare.unwrap_or(false),
-                    class: Box::new(Class {
-                        span: self.span(&c.base),
-                        ctxt: SyntaxContext::empty(),
-                        decorators: vec![],
-                        body: vec![],
-                        super_class,
-                        is_abstract: false,
-                        type_params: None,
-                        super_type_params: None,
-                        implements: vec![],
-                    }),
-                }))
-            }
-            // Import/export handled in convert_statement_to_module_item
-            BabelStmt::ImportDeclaration(_)
-            | BabelStmt::ExportNamedDeclaration(_)
-            | BabelStmt::ExportDefaultDeclaration(_)
-            | BabelStmt::ExportAllDeclaration(_) => Stmt::Empty(EmptyStmt { span: DUMMY_SP }),
-            // TS declarations - extract from source text if available
-            BabelStmt::TSTypeAliasDeclaration(d) => self
-                .extract_source_stmt(&d.base)
-                .unwrap_or(Stmt::Empty(EmptyStmt { span: DUMMY_SP })),
-            BabelStmt::TSInterfaceDeclaration(d) => self
-                .extract_source_stmt(&d.base)
-                .unwrap_or(Stmt::Empty(EmptyStmt { span: DUMMY_SP })),
-            BabelStmt::TSEnumDeclaration(d) => self
-                .extract_source_stmt(&d.base)
-                .unwrap_or(Stmt::Empty(EmptyStmt { span: DUMMY_SP })),
-            // Flow type declarations - extract from source text if available
-            BabelStmt::TypeAlias(d) => self
-                .extract_source_stmt(&d.base)
-                .unwrap_or(Stmt::Empty(EmptyStmt { span: DUMMY_SP })),
-            BabelStmt::OpaqueType(d) => self
-                .extract_source_stmt(&d.base)
-                .unwrap_or(Stmt::Empty(EmptyStmt { span: DUMMY_SP })),
-            BabelStmt::InterfaceDeclaration(d) => self
-                .extract_source_stmt(&d.base)
-                .unwrap_or(Stmt::Empty(EmptyStmt { span: DUMMY_SP })),
-            BabelStmt::EnumDeclaration(d) => self
-                .extract_source_stmt(&d.base)
-                .unwrap_or(Stmt::Empty(EmptyStmt { span: DUMMY_SP })),
-            // Other TS/Flow declarations
-            BabelStmt::TSModuleDeclaration(_)
-            | BabelStmt::TSDeclareFunction(_)
-            | BabelStmt::DeclareVariable(_)
-            | BabelStmt::DeclareFunction(_)
-            | BabelStmt::DeclareClass(_)
-            | BabelStmt::DeclareModule(_)
-            | BabelStmt::DeclareModuleExports(_)
-            | BabelStmt::DeclareExportDeclaration(_)
-            | BabelStmt::DeclareExportAllDeclaration(_)
-            | BabelStmt::DeclareInterface(_)
-            | BabelStmt::DeclareTypeAlias(_)
-            | BabelStmt::DeclareOpaqueType(_) => Stmt::Empty(EmptyStmt { span: DUMMY_SP }),
-            // Only unknown node types without a reverse mapping reach this
-            // arm. Degrading to EmptyStatement would silently drop the node,
-            // so emit a deliberate runtime tripwire (a `throw` in generated
-            // code) instead.
-            BabelStmt::Unknown(unknown) => {
-                let message = format!(
-                    "[react-compiler] internal error: unmodeled statement `{}` reached the SWC reverse converter",
-                    unknown.node_type()
-                );
-                Stmt::Throw(ThrowStmt {
-                    span: DUMMY_SP,
-                    arg: Box::new(Expr::Lit(Lit::Str(Str {
-                        span: DUMMY_SP,
-                        value: self.wtf8(&message),
-                        raw: None,
-                    }))),
+                swc::Program::Script(swc::Script {
+                    span,
+                    body,
+                    shebang,
                 })
             }
         }
     }
 
-    fn convert_block_statement(&self, block: &babel_stmt::BlockStatement) -> BlockStmt {
-        let mut stmts: Vec<Stmt> = Vec::new();
+    fn convert_directive_list(&self, directives: &[Directive]) -> Vec<swc::ModuleItem> {
+        directives
+            .iter()
+            .map(|directive| swc::ModuleItem::Stmt(self.convert_directive(directive)))
+            .collect()
+    }
 
-        // Convert directives to expression statements at the beginning
-        for dir in &block.directives {
-            let span = self.span(&dir.base);
-            let str_span = self.span(&dir.value.base);
-            stmts.push(Stmt::Expr(ExprStmt {
-                span,
-                expr: Box::new(Expr::Lit(Lit::Str(Str {
-                    span: str_span,
-                    value: self.wtf8(&dir.value.value),
-                    raw: None,
-                }))),
-            }));
+    fn convert_directive(&self, d: &Directive) -> swc::Stmt {
+        let span = self.span_from_base(&d.base);
+        let mut str_lit = swc::Str {
+            span: self.span_from_base(&d.value.base),
+            value: d.value.value.as_str().into(),
+            raw: None,
+        };
+        self.preserved_ast.borrow_mut().load_directive(&mut str_lit);
+
+        swc::Stmt::Expr(swc::ExprStmt {
+            span,
+            expr: Box::new(swc::Expr::Lit(swc::Lit::Str(str_lit))),
+        })
+    }
+
+    fn convert_statement_list_with_spans(&self, stmts: &[Statement]) -> Vec<swc::ModuleItem> {
+        stmts
+            .iter()
+            .map(|stmt| {
+                let mut converted = self.convert_statement_as_module_item(stmt);
+                let span = self.get_statement_span(stmt);
+                match &mut converted {
+                    swc::ModuleItem::Stmt(stmt) => set_statement_span(stmt, span),
+                    swc::ModuleItem::ModuleDecl(decl) => self.set_module_decl_span(decl, span),
+                }
+                converted
+            })
+            .collect()
+    }
+
+    fn set_module_decl_span(&self, decl: &mut swc::ModuleDecl, span: Span) {
+        match decl {
+            swc::ModuleDecl::Import(d) => d.span = span,
+            swc::ModuleDecl::ExportDecl(d) => d.span = span,
+            swc::ModuleDecl::ExportNamed(d) => d.span = span,
+            swc::ModuleDecl::ExportDefaultDecl(d) => d.span = span,
+            swc::ModuleDecl::ExportDefaultExpr(d) => d.span = span,
+            swc::ModuleDecl::ExportAll(d) => d.span = span,
+            swc::ModuleDecl::TsImportEquals(d) => d.span = span,
+            swc::ModuleDecl::TsExportAssignment(d) => d.span = span,
+            swc::ModuleDecl::TsNamespaceExport(d) => d.span = span,
         }
+    }
 
-        for s in &block.body {
-            stmts.push(self.convert_statement(s));
+    fn get_statement_span(&self, stmt: &Statement) -> Span {
+        let base = match stmt {
+            Statement::BlockStatement(s) => &s.base,
+            Statement::ReturnStatement(s) => &s.base,
+            Statement::IfStatement(s) => &s.base,
+            Statement::ForStatement(s) => &s.base,
+            Statement::WhileStatement(s) => &s.base,
+            Statement::DoWhileStatement(s) => &s.base,
+            Statement::ForInStatement(s) => &s.base,
+            Statement::ForOfStatement(s) => &s.base,
+            Statement::SwitchStatement(s) => &s.base,
+            Statement::ThrowStatement(s) => &s.base,
+            Statement::TryStatement(s) => &s.base,
+            Statement::BreakStatement(s) => &s.base,
+            Statement::ContinueStatement(s) => &s.base,
+            Statement::LabeledStatement(s) => &s.base,
+            Statement::ExpressionStatement(s) => &s.base,
+            Statement::EmptyStatement(s) => &s.base,
+            Statement::DebuggerStatement(s) => &s.base,
+            Statement::WithStatement(s) => &s.base,
+            Statement::VariableDeclaration(s) => &s.base,
+            Statement::FunctionDeclaration(s) => &s.base,
+            Statement::ClassDeclaration(s) => &s.base,
+            Statement::ImportDeclaration(s) => &s.base,
+            Statement::ExportNamedDeclaration(s) => &s.base,
+            Statement::ExportDefaultDeclaration(s) => &s.base,
+            Statement::ExportAllDeclaration(s) => &s.base,
+            Statement::TSTypeAliasDeclaration(s) => &s.base,
+            Statement::TSInterfaceDeclaration(s) => &s.base,
+            Statement::TSEnumDeclaration(s) => &s.base,
+            Statement::TSModuleDeclaration(s) => &s.base,
+            Statement::TSDeclareFunction(s) => &s.base,
+            Statement::TypeAlias(s) => &s.base,
+            Statement::OpaqueType(s) => &s.base,
+            Statement::InterfaceDeclaration(s) => &s.base,
+            Statement::DeclareVariable(s) => &s.base,
+            Statement::DeclareFunction(s) => &s.base,
+            Statement::DeclareClass(s) => &s.base,
+            Statement::DeclareModule(s) => &s.base,
+            Statement::DeclareModuleExports(s) => &s.base,
+            Statement::DeclareExportDeclaration(s) => &s.base,
+            Statement::DeclareExportAllDeclaration(s) => &s.base,
+            Statement::DeclareInterface(s) => &s.base,
+            Statement::DeclareTypeAlias(s) => &s.base,
+            Statement::DeclareOpaqueType(s) => &s.base,
+            Statement::EnumDeclaration(s) => &s.base,
+            Statement::Unknown(s) => s.base(),
+        };
+        self.span_from_base(base)
+    }
+
+    fn convert_statement_as_module_item(&self, stmt: &Statement) -> swc::ModuleItem {
+        match stmt {
+            Statement::BlockStatement(block) => {
+                swc::Stmt::Block(self.convert_block_statement(block)).into()
+            }
+            Statement::ReturnStatement(ret) => swc::Stmt::Return(swc::ReturnStmt {
+                span: self.span_from_base(&ret.base),
+                arg: ret
+                    .argument
+                    .as_ref()
+                    .map(|arg| Box::new(self.convert_expression(arg))),
+            })
+            .into(),
+            Statement::ExpressionStatement(expr) => swc::Stmt::Expr(swc::ExprStmt {
+                span: self.span_from_base(&expr.base),
+                expr: Box::new(self.convert_expression(&expr.expression)),
+            })
+            .into(),
+            Statement::IfStatement(if_stmt) => swc::Stmt::If(swc::IfStmt {
+                span: self.span_from_base(&if_stmt.base),
+                test: Box::new(self.convert_expression(&if_stmt.test)),
+                cons: Box::new(self.convert_statement(&if_stmt.consequent)),
+                alt: if_stmt
+                    .alternate
+                    .as_ref()
+                    .map(|alt| Box::new(self.convert_statement(alt))),
+            })
+            .into(),
+            Statement::ForStatement(for_stmt) => swc::Stmt::For(swc::ForStmt {
+                span: self.span_from_base(&for_stmt.base),
+                init: for_stmt
+                    .init
+                    .as_ref()
+                    .map(|init| self.convert_for_init(init)),
+                test: for_stmt
+                    .test
+                    .as_ref()
+                    .map(|test| Box::new(self.convert_expression(test))),
+                update: for_stmt
+                    .update
+                    .as_ref()
+                    .map(|update| Box::new(self.convert_expression(update))),
+                body: Box::new(self.convert_statement(&for_stmt.body)),
+            })
+            .into(),
+            Statement::WhileStatement(while_stmt) => swc::Stmt::While(swc::WhileStmt {
+                span: self.span_from_base(&while_stmt.base),
+                test: Box::new(self.convert_expression(&while_stmt.test)),
+                body: Box::new(self.convert_statement(&while_stmt.body)),
+            })
+            .into(),
+            Statement::DoWhileStatement(do_while) => swc::Stmt::DoWhile(swc::DoWhileStmt {
+                span: self.span_from_base(&do_while.base),
+                body: Box::new(self.convert_statement(&do_while.body)),
+                test: Box::new(self.convert_expression(&do_while.test)),
+            })
+            .into(),
+            Statement::ForInStatement(for_in) => swc::Stmt::ForIn(swc::ForInStmt {
+                span: self.span_from_base(&for_in.base),
+                left: self.convert_for_in_of_left(&for_in.left),
+                right: Box::new(self.convert_expression(&for_in.right)),
+                body: Box::new(self.convert_statement(&for_in.body)),
+            })
+            .into(),
+            Statement::ForOfStatement(for_of) => swc::Stmt::ForOf(swc::ForOfStmt {
+                span: self.span_from_base(&for_of.base),
+                is_await: for_of.is_await,
+                left: self.convert_for_in_of_left(&for_of.left),
+                right: Box::new(self.convert_expression(&for_of.right)),
+                body: Box::new(self.convert_statement(&for_of.body)),
+            })
+            .into(),
+            Statement::SwitchStatement(switch_stmt) => swc::Stmt::Switch(swc::SwitchStmt {
+                span: self.span_from_base(&switch_stmt.base),
+                discriminant: Box::new(self.convert_expression(&switch_stmt.discriminant)),
+                cases: switch_stmt
+                    .cases
+                    .iter()
+                    .map(|case| swc::SwitchCase {
+                        span: self.span_from_base(&case.base),
+                        test: case
+                            .test
+                            .as_ref()
+                            .map(|test| Box::new(self.convert_expression(test))),
+                        cons: self.convert_statement_list(&case.consequent),
+                    })
+                    .collect(),
+            })
+            .into(),
+            Statement::ThrowStatement(throw_stmt) => swc::Stmt::Throw(swc::ThrowStmt {
+                span: self.span_from_base(&throw_stmt.base),
+                arg: Box::new(self.convert_expression(&throw_stmt.argument)),
+            })
+            .into(),
+            Statement::TryStatement(try_stmt) => swc::Stmt::Try(Box::new(swc::TryStmt {
+                span: self.span_from_base(&try_stmt.base),
+                block: self.convert_block_statement(&try_stmt.block),
+                handler: try_stmt
+                    .handler
+                    .as_ref()
+                    .map(|handler| self.convert_catch_clause(handler)),
+                finalizer: try_stmt
+                    .finalizer
+                    .as_ref()
+                    .map(|finalizer| self.convert_block_statement(finalizer)),
+            }))
+            .into(),
+            Statement::BreakStatement(break_stmt) => swc::Stmt::Break(swc::BreakStmt {
+                span: self.span_from_base(&break_stmt.base),
+                label: break_stmt
+                    .label
+                    .as_ref()
+                    .map(|label| self.convert_identifier(label)),
+            })
+            .into(),
+            Statement::ContinueStatement(continue_stmt) => swc::Stmt::Continue(swc::ContinueStmt {
+                span: self.span_from_base(&continue_stmt.base),
+                label: continue_stmt
+                    .label
+                    .as_ref()
+                    .map(|label| self.convert_identifier(label)),
+            })
+            .into(),
+            Statement::LabeledStatement(label) => swc::Stmt::Labeled(swc::LabeledStmt {
+                span: self.span_from_base(&label.base),
+                label: self.convert_identifier(&label.label),
+                body: Box::new(self.convert_statement(&label.body)),
+            })
+            .into(),
+            Statement::EmptyStatement(empty) => swc::Stmt::Empty(swc::EmptyStmt {
+                span: self.span_from_base(&empty.base),
+            })
+            .into(),
+            Statement::DebuggerStatement(debugger) => swc::Stmt::Debugger(swc::DebuggerStmt {
+                span: self.span_from_base(&debugger.base),
+            })
+            .into(),
+            Statement::WithStatement(with_stmt) => swc::Stmt::With(swc::WithStmt {
+                span: self.span_from_base(&with_stmt.base),
+                obj: Box::new(self.convert_expression(&with_stmt.object)),
+                body: Box::new(self.convert_statement(&with_stmt.body)),
+            })
+            .into(),
+            Statement::VariableDeclaration(decl) => {
+                swc::Stmt::Decl(self.convert_variable_declaration(decl)).into()
+            }
+            Statement::FunctionDeclaration(func) => {
+                swc::Stmt::Decl(swc::Decl::Fn(self.convert_function_declaration(func))).into()
+            }
+            Statement::ClassDeclaration(class) => {
+                swc::Stmt::Decl(swc::Decl::Class(swc::ClassDecl {
+                    ident: class.id.as_ref().map_or_else(
+                        || self.private_ident("__default_class", &class.base),
+                        |id| self.convert_identifier(id),
+                    ),
+                    declare: class.declare.unwrap_or(false),
+                    class: Box::new(self.convert_class_declaration(class)),
+                }))
+                .into()
+            }
+            Statement::ImportDeclaration(decl) => {
+                swc::ModuleDecl::Import(self.convert_import_declaration(decl)).into()
+            }
+            Statement::ExportNamedDeclaration(decl) => {
+                self.convert_export_named_declaration(decl).into()
+            }
+            Statement::ExportDefaultDeclaration(decl) => {
+                self.convert_export_default_declaration(decl).into()
+            }
+            Statement::ExportAllDeclaration(decl) => {
+                swc::ModuleDecl::ExportAll(self.convert_export_all_declaration(decl)).into()
+            }
+            Statement::TSTypeAliasDeclaration(decl) => self.convert_ts_type_alias_declaration(decl),
+            Statement::TSInterfaceDeclaration(decl) => self.convert_ts_interface_declaration(decl),
+            Statement::TSEnumDeclaration(decl) => self.convert_ts_enum_declaration(decl),
+            Statement::TSModuleDeclaration(decl) => self.convert_ts_module_declaration(decl),
+            Statement::TSDeclareFunction(decl) => self.convert_ts_declare_function(decl),
+            Statement::Unknown(_)
+            | Statement::TypeAlias(_)
+            | Statement::OpaqueType(_)
+            | Statement::InterfaceDeclaration(_)
+            | Statement::DeclareVariable(_)
+            | Statement::DeclareFunction(_)
+            | Statement::DeclareClass(_)
+            | Statement::DeclareModule(_)
+            | Statement::DeclareModuleExports(_)
+            | Statement::DeclareExportDeclaration(_)
+            | Statement::DeclareExportAllDeclaration(_)
+            | Statement::DeclareInterface(_)
+            | Statement::DeclareTypeAlias(_)
+            | Statement::DeclareOpaqueType(_)
+            | Statement::EnumDeclaration(_) => {
+                // This reverse path only handles AST produced by our SWC forward converter;
+                // lossy SWC details are restored from PreservedAst.
+                unreachable!("unsupported statement in SWC round-trip AST")
+            }
         }
+    }
 
-        BlockStmt {
-            span: self.span(&block.base),
+    fn convert_statement(&self, stmt: &Statement) -> swc::Stmt {
+        match self.convert_statement_as_module_item(stmt) {
+            swc::ModuleItem::Stmt(stmt) => stmt,
+            swc::ModuleItem::ModuleDecl(_) => swc::Stmt::Empty(swc::EmptyStmt {
+                span: self.get_statement_span(stmt),
+            }),
+        }
+    }
+
+    fn convert_statement_list(&self, stmts: &[Statement]) -> Vec<swc::Stmt> {
+        stmts
+            .iter()
+            .map(|stmt| self.convert_statement(stmt))
+            .collect()
+    }
+
+    fn convert_block_statement(&self, block: &BlockStatement) -> swc::BlockStmt {
+        let mut stmts = self.convert_statement_list(&block.body);
+        let directives: Vec<_> = block
+            .directives
+            .iter()
+            .map(|directive| self.convert_directive(directive))
+            .collect();
+        if !directives.is_empty() {
+            stmts.splice(0..0, directives);
+        }
+        swc::BlockStmt {
+            span: self.span_from_base(&block.base),
             ctxt: SyntaxContext::empty(),
             stmts,
         }
     }
 
-    fn convert_catch_clause(&self, clause: &babel_stmt::CatchClause) -> CatchClause {
-        let param = clause.param.as_ref().map(|p| self.convert_pattern(p));
-        CatchClause {
-            span: self.span(&clause.base),
-            param,
+    fn convert_catch_clause(&self, clause: &CatchClause) -> swc::CatchClause {
+        swc::CatchClause {
+            span: self.span_from_base(&clause.base),
+            param: clause
+                .param
+                .as_ref()
+                .map(|param| self.convert_pattern_like(param)),
             body: self.convert_block_statement(&clause.body),
         }
     }
 
-    fn convert_for_init(&self, init: &babel_stmt::ForInit) -> VarDeclOrExpr {
+    fn convert_for_init(&self, init: &ForInit) -> swc::VarDeclOrExpr {
         match init {
-            babel_stmt::ForInit::VariableDeclaration(v) => {
-                VarDeclOrExpr::VarDecl(Box::new(self.convert_variable_declaration(v)))
+            ForInit::VariableDeclaration(decl) => {
+                let swc::Decl::Var(decl) = self.convert_variable_declaration(decl) else {
+                    return swc::VarDeclOrExpr::Expr(Box::new(swc::Expr::Invalid(swc::Invalid {
+                        span: DUMMY_SP,
+                    })));
+                };
+                swc::VarDeclOrExpr::VarDecl(decl)
             }
-            babel_stmt::ForInit::Expression(e) => {
-                VarDeclOrExpr::Expr(Box::new(self.convert_expression(e)))
+            ForInit::Expression(expr) => {
+                swc::VarDeclOrExpr::Expr(Box::new(self.convert_expression(expr)))
             }
         }
     }
 
-    fn convert_for_in_of_left(&self, left: &babel_stmt::ForInOfLeft) -> ForHead {
+    fn convert_for_in_of_left(&self, left: &ForInOfLeft) -> swc::ForHead {
         match left {
-            babel_stmt::ForInOfLeft::VariableDeclaration(v) => {
-                ForHead::VarDecl(Box::new(self.convert_variable_declaration(v)))
+            ForInOfLeft::VariableDeclaration(decl) => {
+                let swc::Decl::Var(decl) = self.convert_variable_declaration(decl) else {
+                    return swc::ForHead::Pat(Box::new(swc::Pat::Invalid(swc::Invalid {
+                        span: DUMMY_SP,
+                    })));
+                };
+                swc::ForHead::VarDecl(decl)
             }
-            babel_stmt::ForInOfLeft::Pattern(p) => ForHead::Pat(Box::new(self.convert_pattern(p))),
+            ForInOfLeft::Pattern(pattern) => {
+                swc::ForHead::Pat(Box::new(self.convert_pattern_like(pattern)))
+            }
         }
     }
 
-    fn convert_variable_declaration(&self, decl: &babel_stmt::VariableDeclaration) -> VarDecl {
-        let kind = match decl.kind {
-            babel_stmt::VariableDeclarationKind::Var => VarDeclKind::Var,
-            babel_stmt::VariableDeclarationKind::Let => VarDeclKind::Let,
-            babel_stmt::VariableDeclarationKind::Const => VarDeclKind::Const,
-            babel_stmt::VariableDeclarationKind::Using => VarDeclKind::Var, // SWC doesn't have Using
+    fn convert_variable_declaration(&self, decl: &VariableDeclaration) -> swc::Decl {
+        let kind = self.convert_variable_declaration_kind(&decl.kind);
+        let span = self.span_from_base(&decl.base);
+        let type_ann_mode = if matches!(decl.kind, VariableDeclarationKind::Using) {
+            PatternTypeAnnMode::FromJson
+        } else {
+            PatternTypeAnnMode::Omit
         };
         let decls = decl
             .declarations
             .iter()
-            .map(|d| self.convert_variable_declarator(d))
+            .map(|declarator| self.convert_variable_declarator(declarator, kind, type_ann_mode))
             .collect();
-        let declare = decl.declare.unwrap_or(false);
-        VarDecl {
-            span: self.span(&decl.base),
-            ctxt: SyntaxContext::empty(),
-            kind,
-            declare,
-            decls,
+
+        if matches!(decl.kind, VariableDeclarationKind::Using) {
+            swc::Decl::Using(Box::new(swc::UsingDecl {
+                span,
+                is_await: false,
+                decls,
+            }))
+        } else {
+            let mut var_decl = swc::VarDecl {
+                span,
+                ctxt: SyntaxContext::empty(),
+                kind,
+                declare: decl.declare.unwrap_or(false),
+                decls,
+            };
+            if !self.preserved_ast.borrow_mut().load_var_decl(&mut var_decl)
+                && Self::variable_declarations_have_type_annotations(&decl.declarations)
+            {
+                self.cold_fill_var_decl_types_from_json(&mut var_decl, &decl.declarations);
+            }
+            swc::Decl::Var(Box::new(var_decl))
         }
     }
 
-    fn convert_variable_declarator(&self, d: &babel_stmt::VariableDeclarator) -> VarDeclarator {
-        let name = self.convert_pattern(&d.id);
-        let init = d
-            .init
-            .as_ref()
-            .map(|e| Box::new(self.convert_expression(e)));
-        let definite = d.definite.unwrap_or(false);
-        VarDeclarator {
-            span: self.span(&d.base),
-            name,
-            init,
-            definite,
+    fn convert_variable_declaration_kind(
+        &self,
+        kind: &VariableDeclarationKind,
+    ) -> swc::VarDeclKind {
+        match kind {
+            VariableDeclarationKind::Var => swc::VarDeclKind::Var,
+            VariableDeclarationKind::Let => swc::VarDeclKind::Let,
+            VariableDeclarationKind::Const | VariableDeclarationKind::Using => {
+                swc::VarDeclKind::Const
+            }
+        }
+    }
+
+    fn convert_variable_declarator(
+        &self,
+        declarator: &VariableDeclarator,
+        _kind: swc::VarDeclKind,
+        type_ann_mode: PatternTypeAnnMode,
+    ) -> swc::VarDeclarator {
+        swc::VarDeclarator {
+            span: self.span_from_base(&declarator.base),
+            name: self.convert_pattern_like_with_type_ann_mode(&declarator.id, type_ann_mode),
+            init: declarator
+                .init
+                .as_ref()
+                .map(|init| Box::new(self.convert_expression(init))),
+            definite: declarator.definite.unwrap_or(false),
         }
     }
 
     // ===== Expressions =====
 
-    fn convert_expression(&self, expr: &BabelExpr) -> Expr {
-        match expr {
-            BabelExpr::Identifier(id) => {
-                let span = self.span(&id.base);
-                Expr::Ident(self.ident(&id.name, span))
+    fn convert_expression(&self, expr: &Expression) -> swc::Expr {
+        let span = self.expression_span(expr);
+        let mut swc_expr = match expr {
+            Expression::Identifier(id) => swc::Expr::Ident(self.convert_identifier(id)),
+            Expression::StringLiteral(lit) => {
+                swc::Expr::Lit(swc::Lit::Str(self.convert_string_literal(lit)))
             }
-            BabelExpr::StringLiteral(lit) => Expr::Lit(Lit::Str(Str {
-                span: self.span(&lit.base),
-                value: self.wtf8(&lit.value),
-                raw: self.escape_string_raw(&lit.value),
+            Expression::NumericLiteral(lit) => swc::Expr::Lit(swc::Lit::Num(swc::Number {
+                span: self.span_from_base(&lit.base),
+                value: lit.precise_value(),
+                raw: lit
+                    .extra
+                    .as_ref()
+                    .map(|extra| Atom::from(extra.raw.as_str())),
             })),
-            BabelExpr::NumericLiteral(lit) => {
-                // Convert -0.0 to 0.0 to match Babel's codegen behavior.
-                // Babel outputs `0` for both `-0` and `0`.
-                let value = if lit.value == 0.0 && lit.value.is_sign_negative() {
-                    0.0
-                } else {
-                    lit.value
-                };
-                Expr::Lit(Lit::Num(Number {
-                    span: self.span(&lit.base),
-                    value,
-                    raw: None,
-                }))
-            }
-            BabelExpr::BooleanLiteral(lit) => Expr::Lit(Lit::Bool(Bool {
-                span: self.span(&lit.base),
+            Expression::BooleanLiteral(lit) => swc::Expr::Lit(swc::Lit::Bool(swc::Bool {
+                span: self.span_from_base(&lit.base),
                 value: lit.value,
             })),
-            BabelExpr::NullLiteral(lit) => Expr::Lit(Lit::Null(Null {
-                span: self.span(&lit.base),
+            Expression::NullLiteral(lit) => swc::Expr::Lit(swc::Lit::Null(swc::Null {
+                span: self.span_from_base(&lit.base),
             })),
-            BabelExpr::BigIntLiteral(lit) => Expr::Lit(Lit::BigInt(BigInt {
-                span: self.span(&lit.base),
-                value: Box::new(lit.value.parse().unwrap_or_default()),
-                raw: None,
+            Expression::BigIntLiteral(lit) => swc::Expr::Lit(swc::Lit::BigInt(swc::BigInt {
+                span: self.span_from_base(&lit.base),
+                value: Box::new(bigint_literal_value(&lit.value).parse().unwrap_or_default()),
+                raw: Some(bigint_literal_raw(&lit.value)),
             })),
-            BabelExpr::RegExpLiteral(lit) => Expr::Lit(Lit::Regex(Regex {
-                span: self.span(&lit.base),
-                exp: self.atom(&lit.pattern),
-                flags: self.atom(&lit.flags),
+            Expression::RegExpLiteral(lit) => swc::Expr::Lit(swc::Lit::Regex(swc::Regex {
+                span: self.span_from_base(&lit.base),
+                exp: Atom::from(lit.pattern.as_str()),
+                flags: Atom::from(lit.flags.as_str()),
             })),
-            BabelExpr::CallExpression(call) => {
-                let callee = self.convert_expression(&call.callee);
-                let args = self.convert_arguments(&call.arguments);
-                // Wrap arrow/function expressions in parens when used as
-                // call targets (IIFEs). SWC codegen does not add parens for
-                // `(() => ...)()`, resulting in incorrect code.
-                let callee = match &callee {
-                    Expr::Arrow(_) | Expr::Fn(_) => Expr::Paren(ParenExpr {
-                        span: callee.span(),
-                        expr: Box::new(callee),
-                    }),
-                    _ => callee,
+            Expression::CallExpression(call) => swc::Expr::Call(self.convert_call_expression(call)),
+            Expression::MemberExpression(member) => self.convert_member_expression(member),
+            Expression::OptionalCallExpression(call) => {
+                let mut opt_call = swc::OptCall {
+                    span: self.span_from_base(&call.base),
+                    ctxt: SyntaxContext::empty(),
+                    callee: Box::new(self.convert_expression(&call.callee)),
+                    args: self.convert_expression_list(&call.arguments),
+                    type_args: None,
                 };
-                Expr::Call(CallExpr {
-                    span: self.span(&call.base),
-                    ctxt: SyntaxContext::empty(),
-                    callee: Callee::Expr(Box::new(callee)),
-                    args,
-                    type_args: None,
-                })
-            }
-            BabelExpr::MemberExpression(m) => self.convert_member_expression(m),
-            BabelExpr::OptionalCallExpression(call) => {
-                let callee = self.convert_expression_for_chain(&call.callee);
-                let args = self.convert_arguments(&call.arguments);
-                let base = OptChainBase::Call(OptCall {
-                    span: self.span(&call.base),
-                    ctxt: SyntaxContext::empty(),
-                    callee: Box::new(callee),
-                    args,
-                    type_args: None,
-                });
-                Expr::OptChain(OptChainExpr {
-                    span: self.span(&call.base),
+                if !self.preserved_ast.borrow_mut().load_opt_call(&mut opt_call)
+                    && Self::has_type_args(
+                        call.type_parameters.as_deref(),
+                        call.type_arguments.as_deref(),
+                    )
+                {
+                    self.cold_fill_opt_call_type_args_from_json(
+                        &mut opt_call,
+                        call.type_parameters.as_deref(),
+                        call.type_arguments.as_deref(),
+                    );
+                }
+                swc::Expr::OptChain(swc::OptChainExpr {
+                    span: self.span_from_base(&call.base),
                     optional: call.optional,
-                    base: Box::new(base),
+                    base: Box::new(swc::OptChainBase::Call(opt_call)),
                 })
             }
-            BabelExpr::OptionalMemberExpression(m) => {
-                let base = self.convert_optional_member_to_chain_base(m);
-                Expr::OptChain(OptChainExpr {
-                    span: self.span(&m.base),
-                    optional: m.optional,
-                    base: Box::new(base),
+            Expression::OptionalMemberExpression(member) => {
+                swc::Expr::OptChain(swc::OptChainExpr {
+                    span: self.span_from_base(&member.base),
+                    optional: member.optional,
+                    base: Box::new(swc::OptChainBase::Member(
+                        self.convert_optional_member_expression_as_chain_element(member),
+                    )),
                 })
             }
-            BabelExpr::BinaryExpression(bin) => {
-                let op = self.convert_binary_operator(&bin.operator);
-                Expr::Bin(BinExpr {
-                    span: self.span(&bin.base),
-                    op,
-                    left: Box::new(self.convert_expression(&bin.left)),
-                    right: Box::new(self.convert_expression(&bin.right)),
-                })
-            }
-            BabelExpr::LogicalExpression(log) => {
-                let op = self.convert_logical_operator(&log.operator);
-                let span = self.span(&log.base);
-                let bin = Expr::Bin(BinExpr {
-                    span,
-                    op,
-                    left: Box::new(self.convert_expression(&log.left)),
-                    right: Box::new(self.convert_expression(&log.right)),
-                });
-                // Wrap all logical expressions in parentheses. Logical
-                // operators (||, &&, ??) have lower precedence than most
-                // binary operators, but SWC's codegen does not always insert
-                // parens correctly (e.g., `a + b || c` vs `a + (b || c)`).
-                // Wrapping unconditionally is safe.
-                Expr::Paren(ParenExpr {
-                    span,
-                    expr: Box::new(bin),
-                })
-            }
-            BabelExpr::UnaryExpression(un) => {
-                let op = self.convert_unary_operator(&un.operator);
-                Expr::Unary(UnaryExpr {
-                    span: self.span(&un.base),
-                    op,
-                    arg: Box::new(self.convert_expression(&un.argument)),
-                })
-            }
-            BabelExpr::UpdateExpression(up) => {
-                let op = self.convert_update_operator(&up.operator);
-                Expr::Update(UpdateExpr {
-                    span: self.span(&up.base),
-                    op,
-                    prefix: up.prefix,
-                    arg: Box::new(self.convert_expression(&up.argument)),
-                })
-            }
-            BabelExpr::ConditionalExpression(cond) => {
-                let span = self.span(&cond.base);
-                // Wrap conditional expressions in parentheses. SWC's codegen
-                // does not always insert parens for ternaries inside binary
-                // or assignment expressions (e.g., `x + cond ? a : b` instead
-                // of `x + (cond ? a : b)`).
-                Expr::Paren(ParenExpr {
-                    span,
-                    expr: Box::new(Expr::Cond(CondExpr {
-                        span,
-                        test: Box::new(self.convert_expression(&cond.test)),
-                        cons: Box::new(self.convert_expression(&cond.consequent)),
-                        alt: Box::new(self.convert_expression(&cond.alternate)),
-                    })),
-                })
-            }
-            BabelExpr::AssignmentExpression(assign) => {
-                let op = self.convert_assignment_operator(&assign.operator);
-                let left = self.convert_pattern_to_assign_target(&assign.left);
-                let span = self.span(&assign.base);
-                let assign_expr = Expr::Assign(AssignExpr {
-                    span,
-                    op,
-                    left,
-                    right: Box::new(self.convert_expression(&assign.right)),
-                });
-                // Wrap assignment expressions in parentheses. SWC's codegen
-                // does not always insert necessary parens for assignments
-                // when they appear as operands of binary/logical expressions
-                // (e.g., `x + x = 2` instead of `x + (x = 2)`).
-                Expr::Paren(ParenExpr {
-                    span,
-                    expr: Box::new(assign_expr),
-                })
-            }
-            BabelExpr::SequenceExpression(seq) => {
-                let exprs = seq
+            Expression::BinaryExpression(binary) => swc::Expr::Bin(swc::BinExpr {
+                span: self.span_from_base(&binary.base),
+                op: self.convert_binary_operator(&binary.operator),
+                left: Box::new(self.convert_expression(&binary.left)),
+                right: Box::new(self.convert_expression(&binary.right)),
+            }),
+            Expression::LogicalExpression(logical) => swc::Expr::Bin(swc::BinExpr {
+                span: self.span_from_base(&logical.base),
+                op: self.convert_logical_operator(&logical.operator),
+                left: Box::new(self.convert_expression(&logical.left)),
+                right: Box::new(self.convert_expression(&logical.right)),
+            }),
+            Expression::UnaryExpression(unary) => swc::Expr::Unary(swc::UnaryExpr {
+                span: self.span_from_base(&unary.base),
+                op: self.convert_unary_operator(&unary.operator),
+                arg: Box::new(self.convert_expression(&unary.argument)),
+            }),
+            Expression::UpdateExpression(update) => swc::Expr::Update(swc::UpdateExpr {
+                span: self.span_from_base(&update.base),
+                op: self.convert_update_operator(&update.operator),
+                prefix: update.prefix,
+                arg: Box::new(self.convert_expression(&update.argument)),
+            }),
+            Expression::ConditionalExpression(cond) => swc::Expr::Cond(swc::CondExpr {
+                span: self.span_from_base(&cond.base),
+                test: Box::new(self.convert_expression(&cond.test)),
+                cons: Box::new(self.convert_expression(&cond.consequent)),
+                alt: Box::new(self.convert_expression(&cond.alternate)),
+            }),
+            Expression::AssignmentExpression(assign) => swc::Expr::Assign(swc::AssignExpr {
+                span: self.span_from_base(&assign.base),
+                op: self.convert_assignment_operator(&assign.operator),
+                left: self.convert_pattern_like_as_assign_target(&assign.left),
+                right: Box::new(self.convert_expression(&assign.right)),
+            }),
+            Expression::SequenceExpression(seq) => swc::Expr::Seq(swc::SeqExpr {
+                span: self.span_from_base(&seq.base),
+                exprs: seq
                     .expressions
                     .iter()
-                    .map(|e| Box::new(self.convert_expression(e)))
-                    .collect();
-                let span = self.span(&seq.base);
-                // Wrap sequence expressions in parentheses. SWC's codegen
-                // does not always insert necessary parens for sequence
-                // expressions (e.g., in ternary consequent position), so
-                // wrapping unconditionally is safe and prevents parse errors.
-                Expr::Paren(ParenExpr {
-                    span,
-                    expr: Box::new(Expr::Seq(SeqExpr { span, exprs })),
-                })
+                    .map(|expr| Box::new(self.convert_expression(expr)))
+                    .collect(),
+            }),
+            Expression::ArrowFunctionExpression(arrow) => {
+                self.convert_arrow_function_expression(arrow)
             }
-            BabelExpr::ArrowFunctionExpression(arrow) => self.convert_arrow_function(arrow),
-            BabelExpr::FunctionExpression(func) => {
-                let ident = func
-                    .id
-                    .as_ref()
-                    .map(|id| self.ident(&id.name, self.span(&id.base)));
-                let params = self.convert_params(&func.params);
-                let body = Some(self.convert_block_statement(&func.body));
-                Expr::Fn(FnExpr {
-                    ident,
-                    function: Box::new(Function {
-                        params,
-                        decorators: vec![],
-                        span: self.span(&func.base),
-                        ctxt: SyntaxContext::empty(),
-                        body,
-                        is_generator: func.generator,
-                        is_async: func.is_async,
-                        type_params: None,
-                        return_type: None,
-                    }),
-                })
-            }
-            BabelExpr::ObjectExpression(obj) => {
-                let props = obj
+            Expression::FunctionExpression(func) => swc::Expr::Fn(swc::FnExpr {
+                ident: func.id.as_ref().map(|id| self.convert_identifier(id)),
+                function: Box::new(self.convert_function_expression(func)),
+            }),
+            Expression::ObjectExpression(obj) => swc::Expr::Object(swc::ObjectLit {
+                span: self.span_from_base(&obj.base),
+                props: obj
                     .properties
                     .iter()
-                    .map(|p| self.convert_object_expression_property(p))
-                    .collect();
-                Expr::Object(ObjectLit {
-                    span: self.span(&obj.base),
-                    props,
-                })
-            }
-            BabelExpr::ArrayExpression(arr) => {
-                let elems = arr
+                    .map(|prop| self.convert_object_expression_property(prop))
+                    .collect(),
+            }),
+            Expression::ArrayExpression(arr) => swc::Expr::Array(swc::ArrayLit {
+                span: self.span_from_base(&arr.base),
+                elems: arr
                     .elements
                     .iter()
-                    .map(|e| self.convert_array_element(e))
-                    .collect();
-                Expr::Array(ArrayLit {
-                    span: self.span(&arr.base),
-                    elems,
-                })
-            }
-            BabelExpr::NewExpression(n) => {
-                let callee = Box::new(self.convert_expression(&n.callee));
-                let args = Some(self.convert_arguments(&n.arguments));
-                Expr::New(NewExpr {
-                    span: self.span(&n.base),
-                    ctxt: SyntaxContext::empty(),
-                    callee,
-                    args,
-                    type_args: None,
-                })
-            }
-            BabelExpr::TemplateLiteral(tl) => {
-                let template = self.convert_template_literal(tl);
-                Expr::Tpl(template)
-            }
-            BabelExpr::TaggedTemplateExpression(tag) => {
-                let t = Box::new(self.convert_expression(&tag.tag));
-                let tpl = Box::new(self.convert_template_literal(&tag.quasi));
-                Expr::TaggedTpl(TaggedTpl {
-                    span: self.span(&tag.base),
-                    ctxt: SyntaxContext::empty(),
-                    tag: t,
-                    type_params: None,
-                    tpl,
-                })
-            }
-            BabelExpr::AwaitExpression(a) => Expr::Await(AwaitExpr {
-                span: self.span(&a.base),
-                arg: Box::new(self.convert_expression(&a.argument)),
+                    .map(|elem| {
+                        elem.as_ref()
+                            .map(|elem| self.convert_expression_as_argument(elem))
+                    })
+                    .collect(),
             }),
-            BabelExpr::YieldExpression(y) => Expr::Yield(YieldExpr {
-                span: self.span(&y.base),
-                delegate: y.delegate,
-                arg: y
+            Expression::NewExpression(new) => {
+                let mut new_expr = swc::NewExpr {
+                    span: self.span_from_base(&new.base),
+                    ctxt: SyntaxContext::empty(),
+                    callee: Box::new(self.convert_expression(&new.callee)),
+                    args: Some(self.convert_expression_list(&new.arguments)),
+                    type_args: None,
+                };
+                if !self.preserved_ast.borrow_mut().load_new(&mut new_expr)
+                    && Self::has_type_args(
+                        new.type_parameters.as_deref(),
+                        new.type_arguments.as_deref(),
+                    )
+                {
+                    self.cold_fill_new_type_args_from_json(
+                        &mut new_expr,
+                        new.type_parameters.as_deref(),
+                        new.type_arguments.as_deref(),
+                    );
+                }
+                swc::Expr::New(new_expr)
+            }
+            Expression::TemplateLiteral(tpl) => swc::Expr::Tpl(self.convert_template_literal(tpl)),
+            Expression::TaggedTemplateExpression(tagged) => {
+                let mut tagged_tpl = swc::TaggedTpl {
+                    span: self.span_from_base(&tagged.base),
+                    ctxt: SyntaxContext::empty(),
+                    tag: Box::new(self.convert_expression(&tagged.tag)),
+                    type_params: None,
+                    tpl: Box::new(self.convert_template_literal(&tagged.quasi)),
+                };
+                if !self
+                    .preserved_ast
+                    .borrow_mut()
+                    .load_tagged_tpl(&mut tagged_tpl)
+                    && Self::has_type_annotation(tagged.type_parameters.as_deref())
+                {
+                    self.cold_fill_tagged_tpl_type_params_from_json(
+                        &mut tagged_tpl,
+                        tagged.type_parameters.as_deref(),
+                    );
+                }
+                swc::Expr::TaggedTpl(tagged_tpl)
+            }
+            Expression::AwaitExpression(await_expr) => swc::Expr::Await(swc::AwaitExpr {
+                span: self.span_from_base(&await_expr.base),
+                arg: Box::new(self.convert_expression(&await_expr.argument)),
+            }),
+            Expression::YieldExpression(yield_expr) => swc::Expr::Yield(swc::YieldExpr {
+                span: self.span_from_base(&yield_expr.base),
+                arg: yield_expr
                     .argument
                     .as_ref()
-                    .map(|a| Box::new(self.convert_expression(a))),
+                    .map(|arg| Box::new(self.convert_expression(arg))),
+                delegate: yield_expr.delegate,
             }),
-            BabelExpr::SpreadElement(s) => {
-                // SpreadElement can't be a standalone expression in SWC.
-                // Return the argument directly as a fallback.
-                self.convert_expression(&s.argument)
-            }
-            BabelExpr::MetaProperty(mp) => Expr::MetaProp(MetaPropExpr {
-                span: self.span(&mp.base),
-                kind: match (mp.meta.name.as_str(), mp.property.name.as_str()) {
-                    ("new", "target") => MetaPropKind::NewTarget,
-                    ("import", "meta") => MetaPropKind::ImportMeta,
-                    _ => MetaPropKind::NewTarget,
+            Expression::SpreadElement(spread) => self.convert_expression(&spread.argument),
+            Expression::MetaProperty(meta) => swc::Expr::MetaProp(swc::MetaPropExpr {
+                span: self.span_from_base(&meta.base),
+                kind: if meta.meta.name == "import" && meta.property.name == "meta" {
+                    swc::MetaPropKind::ImportMeta
+                } else {
+                    swc::MetaPropKind::NewTarget
                 },
             }),
-            BabelExpr::ClassExpression(c) => {
-                let ident =
-                    c.id.as_ref()
-                        .map(|id| self.ident(&id.name, self.span(&id.base)));
-                let super_class = c
-                    .super_class
-                    .as_ref()
-                    .map(|s| Box::new(self.convert_expression(s)));
-                Expr::Class(ClassExpr {
-                    ident,
-                    class: Box::new(Class {
-                        span: self.span(&c.base),
-                        ctxt: SyntaxContext::empty(),
-                        decorators: vec![],
-                        body: vec![],
-                        super_class,
-                        is_abstract: false,
-                        type_params: None,
-                        super_type_params: None,
-                        implements: vec![],
-                    }),
-                })
-            }
-            BabelExpr::PrivateName(p) => Expr::PrivateName(PrivateName {
-                span: self.span(&p.base),
-                name: self.atom(&p.id.name),
+            Expression::ClassExpression(class) => swc::Expr::Class(swc::ClassExpr {
+                ident: class.id.as_ref().map(|id| self.convert_identifier(id)),
+                class: Box::new(self.make_class(
+                    &class.base,
+                    class.super_class.as_deref(),
+                    &class.body,
+                    false,
+                )),
             }),
-            BabelExpr::Super(s) => Expr::Ident(self.ident("super", self.span(&s.base))),
-            BabelExpr::Import(i) => Expr::Ident(self.ident("import", self.span(&i.base))),
-            BabelExpr::ThisExpression(t) => Expr::This(ThisExpr {
-                span: self.span(&t.base),
+            Expression::PrivateName(private) => swc::Expr::PrivateName(swc::PrivateName {
+                span: self.span_from_base(&private.base),
+                name: self.atom(&private.id.name),
             }),
-            BabelExpr::ParenthesizedExpression(p) => Expr::Paren(ParenExpr {
-                span: self.span(&p.base),
-                expr: Box::new(self.convert_expression(&p.expression)),
+            Expression::Super(super_expr) => swc::Expr::Invalid(swc::Invalid {
+                span: self.span_from_base(&super_expr.base),
             }),
-            BabelExpr::JSXElement(el) => {
-                let element = self.convert_jsx_element(el.as_ref());
-                Expr::JSXElement(Box::new(element))
+            Expression::Import(import) => swc::Expr::Invalid(swc::Invalid {
+                span: self.span_from_base(&import.base),
+            }),
+            Expression::ThisExpression(this) => swc::Expr::This(swc::ThisExpr {
+                span: self.span_from_base(&this.base),
+            }),
+            Expression::ParenthesizedExpression(paren) => swc::Expr::Paren(swc::ParenExpr {
+                span: self.span_from_base(&paren.base),
+                expr: Box::new(self.convert_expression(&paren.expression)),
+            }),
+            Expression::JSXElement(el) => {
+                swc::Expr::JSXElement(Box::new(self.convert_jsx_element(el)))
             }
-            BabelExpr::JSXFragment(frag) => {
-                let fragment = self.convert_jsx_fragment(frag);
-                Expr::JSXFragment(fragment)
+            Expression::JSXFragment(frag) => {
+                swc::Expr::JSXFragment(self.convert_jsx_fragment(frag))
             }
-            // TS expressions - preserve as SWC TS nodes
-            BabelExpr::TSAsExpression(e) => {
-                let expr = Box::new(self.convert_expression(&e.expression));
-                let span = self.span(&e.base);
-                let annotation = e.type_annotation.parse_value();
-                // Check if this is "as const" — Babel represents it as
-                // TSAsExpression with typeAnnotation: TSTypeReference { typeName: Identifier { name: "const" } }
-                let is_as_const = annotation.get("type").and_then(|v| v.as_str())
-                    == Some("TSTypeReference")
-                    && annotation
-                        .get("typeName")
-                        .and_then(|tn| tn.get("name"))
-                        .and_then(|n| n.as_str())
-                        == Some("const");
-
-                if is_as_const {
-                    Expr::TsConstAssertion(TsConstAssertion { span, expr })
-                } else {
-                    let type_ann = self.convert_ts_type_from_json(&annotation, span);
-                    Expr::TsAs(TsAsExpr {
+            Expression::AssignmentPattern(pattern) => swc::Expr::Assign(swc::AssignExpr {
+                span: self.span_from_base(&pattern.base),
+                op: swc::AssignOp::Assign,
+                left: self.convert_pattern_like_as_assign_target(&pattern.left),
+                right: Box::new(self.convert_expression(&pattern.right)),
+            }),
+            Expression::TSAsExpression(ts) => {
+                let span = self.span_from_base(&ts.base);
+                let mut expr = swc::TsAsExpr {
+                    span,
+                    expr: Box::new(self.convert_expression(&ts.expression)),
+                    type_ann: self.any_ts_type(span),
+                };
+                if !self.preserved_ast.borrow_mut().load_ts_as_expr(&mut expr) {
+                    self.cold_fill_ts_as_expr_from_json(&mut expr, &ts.type_annotation, span);
+                }
+                swc::Expr::TsAs(expr)
+            }
+            Expression::TSSatisfiesExpression(ts) => {
+                let span = self.span_from_base(&ts.base);
+                let mut expr = swc::TsSatisfiesExpr {
+                    span,
+                    expr: Box::new(self.convert_expression(&ts.expression)),
+                    type_ann: self.any_ts_type(span),
+                };
+                if !self
+                    .preserved_ast
+                    .borrow_mut()
+                    .load_ts_satisfies_expr(&mut expr)
+                {
+                    self.cold_fill_ts_satisfies_expr_from_json(
+                        &mut expr,
+                        &ts.type_annotation,
                         span,
-                        expr,
-                        type_ann: Box::new(type_ann),
-                    })
+                    );
                 }
+                swc::Expr::TsSatisfies(expr)
             }
-            BabelExpr::TSSatisfiesExpression(e) => self.convert_expression(&e.expression),
-            BabelExpr::TSNonNullExpression(e) => Expr::TsNonNull(TsNonNullExpr {
-                span: self.span(&e.base),
-                expr: Box::new(self.convert_expression(&e.expression)),
+            Expression::TSNonNullExpression(ts) => swc::Expr::TsNonNull(swc::TsNonNullExpr {
+                span: self.span_from_base(&ts.base),
+                expr: Box::new(self.convert_expression(&ts.expression)),
             }),
-            BabelExpr::TSTypeAssertion(e) => self.convert_expression(&e.expression),
-            BabelExpr::TSInstantiationExpression(e) => self.convert_expression(&e.expression),
-            BabelExpr::TypeCastExpression(e) => self.convert_expression(&e.expression),
-            BabelExpr::AssignmentPattern(p) => {
-                let left = self.convert_pattern_to_assign_target(&p.left);
-                Expr::Assign(AssignExpr {
-                    span: self.span(&p.base),
-                    op: AssignOp::Assign,
-                    left,
-                    right: Box::new(self.convert_expression(&p.right)),
-                })
-            }
-        }
-    }
-
-    /// Convert an expression that may be used inside a chain (optional chaining).
-    ///
-    /// In Babel, a chain like `a?.b.c()` is represented as nested
-    /// OptionalMemberExpression / OptionalCallExpression nodes. Each node
-    /// has an `optional` flag indicating whether it uses `?.` at that point.
-    ///
-    /// In SWC, each `?.` point is wrapped in an `OptChainExpr`. Nodes in
-    /// the chain that do NOT have `?.` are plain `MemberExpr` / `CallExpr`.
-    ///
-    /// So when `optional: true`, we still need to emit `OptChainExpr`.
-    /// When `optional: false`, we emit a plain expr (part of the parent chain).
-    fn convert_expression_for_chain(&self, expr: &BabelExpr) -> Expr {
-        match expr {
-            BabelExpr::OptionalMemberExpression(m) => {
-                if m.optional {
-                    // This node uses `?.`, wrap in OptChainExpr
-                    let base = self.convert_optional_member_to_chain_base(m);
-                    Expr::OptChain(OptChainExpr {
-                        span: self.span(&m.base),
-                        optional: true,
-                        base: Box::new(base),
-                    })
-                } else {
-                    // Part of a chain but no `?.` here — plain MemberExpr
-                    self.convert_optional_member_to_member_expr(m)
+            Expression::TSTypeAssertion(ts) => {
+                let span = self.span_from_base(&ts.base);
+                let mut expr = swc::TsTypeAssertion {
+                    span,
+                    expr: Box::new(self.convert_expression(&ts.expression)),
+                    type_ann: self.any_ts_type(span),
+                };
+                if !self
+                    .preserved_ast
+                    .borrow_mut()
+                    .load_ts_type_assertion(&mut expr)
+                {
+                    self.cold_fill_ts_type_assertion_from_json(
+                        &mut expr,
+                        &ts.type_annotation,
+                        span,
+                    );
                 }
+                swc::Expr::TsTypeAssertion(expr)
             }
-            BabelExpr::OptionalCallExpression(call) => {
-                let callee = self.convert_expression_for_chain(&call.callee);
-                let args = self.convert_arguments(&call.arguments);
-                if call.optional {
-                    // This node uses `?.()`, wrap in OptChainExpr
-                    let base = OptChainBase::Call(OptCall {
-                        span: self.span(&call.base),
-                        ctxt: SyntaxContext::empty(),
-                        callee: Box::new(callee),
-                        args,
-                        type_args: None,
-                    });
-                    Expr::OptChain(OptChainExpr {
-                        span: self.span(&call.base),
-                        optional: true,
-                        base: Box::new(base),
-                    })
-                } else {
-                    // Part of a chain but no `?.` here — plain CallExpr
-                    Expr::Call(CallExpr {
-                        span: self.span(&call.base),
-                        ctxt: SyntaxContext::empty(),
-                        callee: Callee::Expr(Box::new(callee)),
-                        args,
-                        type_args: None,
-                    })
+            Expression::TSInstantiationExpression(ts) => {
+                let span = self.span_from_base(&ts.base);
+                let mut expr = swc::TsInstantiation {
+                    span,
+                    expr: Box::new(self.convert_expression(&ts.expression)),
+                    type_args: Box::new(swc::TsTypeParamInstantiation {
+                        span,
+                        params: vec![],
+                    }),
+                };
+                if !self
+                    .preserved_ast
+                    .borrow_mut()
+                    .load_ts_instantiation(&mut expr)
+                {
+                    self.cold_fill_ts_instantiation_from_json(&mut expr, &ts.type_parameters, span);
                 }
+                swc::Expr::TsInstantiation(expr)
             }
-            _ => self.convert_expression(expr),
-        }
-    }
-
-    fn convert_member_expression(&self, m: &babel_expr::MemberExpression) -> Expr {
-        let object = self.convert_expression(&m.object);
-        // When an optional chain expression is used as the object of a
-        // non-optional member expression (e.g., `(props?.a).b`), wrap it
-        // in parens to properly terminate the optional chain. Without
-        // parens, SWC codegen emits `props?.a.b` which extends the chain.
-        let object = match &object {
-            Expr::OptChain(_) => Box::new(Expr::Paren(ParenExpr {
-                span: object.span(),
-                expr: Box::new(object),
-            })),
-            _ => Box::new(object),
+            Expression::TypeCastExpression(type_cast) => {
+                self.convert_expression(&type_cast.expression)
+            }
         };
-        if m.computed {
-            let property = self.convert_expression(&m.property);
-            Expr::Member(MemberExpr {
-                span: self.span(&m.base),
-                obj: object,
-                prop: MemberProp::Computed(ComputedPropName {
-                    span: DUMMY_SP,
-                    expr: Box::new(property),
-                }),
-            })
-        } else {
-            let prop_name = self.expression_to_ident_name(&m.property);
-            Expr::Member(MemberExpr {
-                span: self.span(&m.base),
-                obj: object,
-                prop: MemberProp::Ident(prop_name),
-            })
+        self.preserved_ast
+            .borrow_mut()
+            .load_ts_expr_for_span(&mut swc_expr, span);
+        swc_expr
+    }
+
+    fn convert_call_expression(&self, call: &CallExpression) -> swc::CallExpr {
+        let callee = match call.callee.as_ref() {
+            Expression::Super(super_expr) => swc::Callee::Super(swc::Super {
+                span: self.span_from_base(&super_expr.base),
+            }),
+            Expression::Import(import) => swc::Callee::Import(swc::Import {
+                span: self.span_from_base(&import.base),
+                phase: swc::ImportPhase::Evaluation,
+            }),
+            _ => swc::Callee::Expr(Box::new(self.convert_expression(&call.callee))),
+        };
+
+        let mut call_expr = swc::CallExpr {
+            span: self.span_from_base(&call.base),
+            ctxt: SyntaxContext::empty(),
+            callee,
+            args: self.convert_expression_list(&call.arguments),
+            type_args: None,
+        };
+        if !self.preserved_ast.borrow_mut().load_call(&mut call_expr)
+            && Self::has_type_args(
+                call.type_parameters.as_deref(),
+                call.type_arguments.as_deref(),
+            )
+        {
+            self.cold_fill_call_type_args_from_json(
+                &mut call_expr,
+                call.type_parameters.as_deref(),
+                call.type_arguments.as_deref(),
+            );
         }
+        call_expr
     }
 
-    fn convert_optional_member_to_chain_base(
-        &self,
-        m: &babel_expr::OptionalMemberExpression,
-    ) -> OptChainBase {
-        let object = Box::new(self.convert_expression_for_chain(&m.object));
-        if m.computed {
-            let property = self.convert_expression(&m.property);
-            OptChainBase::Member(MemberExpr {
-                span: self.span(&m.base),
-                obj: object,
-                prop: MemberProp::Computed(ComputedPropName {
-                    span: DUMMY_SP,
-                    expr: Box::new(property),
-                }),
-            })
-        } else {
-            let prop_name = self.expression_to_ident_name(&m.property);
-            OptChainBase::Member(MemberExpr {
-                span: self.span(&m.base),
-                obj: object,
-                prop: MemberProp::Ident(prop_name),
-            })
+    fn convert_member_expression(&self, m: &MemberExpression) -> swc::Expr {
+        if let Expression::Super(super_expr) = m.object.as_ref() {
+            let prop = if m.computed {
+                swc::SuperProp::Computed(swc::ComputedPropName {
+                    span: self.span_from_base(&m.property_base()),
+                    expr: Box::new(self.convert_expression(&m.property)),
+                })
+            } else {
+                swc::SuperProp::Ident(self.expression_to_identifier_name(&m.property))
+            };
+            return swc::Expr::SuperProp(swc::SuperPropExpr {
+                span: self.span_from_base(&m.base),
+                obj: swc::Super {
+                    span: self.span_from_base(&super_expr.base),
+                },
+                prop,
+            });
         }
-    }
 
-    fn convert_optional_member_to_member_expr(
-        &self,
-        m: &babel_expr::OptionalMemberExpression,
-    ) -> Expr {
-        let object = Box::new(self.convert_expression_for_chain(&m.object));
-        if m.computed {
-            let property = self.convert_expression(&m.property);
-            Expr::Member(MemberExpr {
-                span: self.span(&m.base),
-                obj: object,
-                prop: MemberProp::Computed(ComputedPropName {
-                    span: DUMMY_SP,
-                    expr: Box::new(property),
-                }),
-            })
-        } else {
-            let prop_name = self.expression_to_ident_name(&m.property);
-            Expr::Member(MemberExpr {
-                span: self.span(&m.base),
-                obj: object,
-                prop: MemberProp::Ident(prop_name),
-            })
-        }
-    }
-
-    fn expression_to_ident_name(&self, expr: &BabelExpr) -> IdentName {
-        match expr {
-            BabelExpr::Identifier(id) => self.ident_name(&id.name, self.span(&id.base)),
-            _ => self.ident_name("__unknown__", DUMMY_SP),
-        }
-    }
-
-    fn convert_arguments(&self, args: &[BabelExpr]) -> Vec<ExprOrSpread> {
-        args.iter().map(|a| self.convert_argument(a)).collect()
-    }
-
-    fn convert_argument(&self, arg: &BabelExpr) -> ExprOrSpread {
-        match arg {
-            BabelExpr::SpreadElement(s) => ExprOrSpread {
-                spread: Some(self.span(&s.base)),
-                expr: Box::new(self.convert_expression(&s.argument)),
+        swc::Expr::Member(swc::MemberExpr {
+            span: self.span_from_base(&m.base),
+            obj: Box::new(self.convert_expression(&m.object)),
+            prop: if m.computed {
+                swc::MemberProp::Computed(swc::ComputedPropName {
+                    span: self.span_from_base(&m.property_base()),
+                    expr: Box::new(self.convert_expression(&m.property)),
+                })
+            } else {
+                match m.property.as_ref() {
+                    Expression::PrivateName(private) => {
+                        swc::MemberProp::PrivateName(swc::PrivateName {
+                            span: self.span_from_base(&private.base),
+                            name: self.atom(&private.id.name),
+                        })
+                    }
+                    _ => swc::MemberProp::Ident(self.expression_to_identifier_name(&m.property)),
+                }
             },
-            _ => ExprOrSpread {
+        })
+    }
+
+    fn convert_optional_member_expression_as_chain_element(
+        &self,
+        m: &OptionalMemberExpression,
+    ) -> swc::MemberExpr {
+        swc::MemberExpr {
+            span: self.span_from_base(&m.base),
+            obj: Box::new(self.convert_expression(&m.object)),
+            prop: if m.computed {
+                swc::MemberProp::Computed(swc::ComputedPropName {
+                    span: self.span_from_base(&m.property_base()),
+                    expr: Box::new(self.convert_expression(&m.property)),
+                })
+            } else {
+                swc::MemberProp::Ident(self.expression_to_identifier_name(&m.property))
+            },
+        }
+    }
+
+    fn expression_to_identifier_name(&self, expr: &Expression) -> swc::IdentName {
+        match expr {
+            Expression::Identifier(id) => self.make_ident_name(&id.base, &id.name),
+            _ => swc::IdentName::new(Atom::from("__computed"), self.expression_span(expr)),
+        }
+    }
+
+    fn convert_expression_list(&self, arguments: &[Expression]) -> Vec<swc::ExprOrSpread> {
+        arguments
+            .iter()
+            .map(|arg| self.convert_expression_as_argument(arg))
+            .collect()
+    }
+
+    fn convert_expression_as_argument(&self, arg: &Expression) -> swc::ExprOrSpread {
+        match arg {
+            Expression::SpreadElement(spread) => swc::ExprOrSpread {
+                spread: Some(self.span_from_base(&spread.base)),
+                expr: Box::new(self.convert_expression(&spread.argument)),
+            },
+            _ => swc::ExprOrSpread {
                 spread: None,
                 expr: Box::new(self.convert_expression(arg)),
             },
         }
     }
 
-    fn convert_array_element(&self, elem: &Option<BabelExpr>) -> Option<ExprOrSpread> {
-        match elem {
-            None => None,
-            Some(BabelExpr::SpreadElement(s)) => Some(ExprOrSpread {
-                spread: Some(self.span(&s.base)),
-                expr: Box::new(self.convert_expression(&s.argument)),
-            }),
-            Some(e) => Some(ExprOrSpread {
-                spread: None,
-                expr: Box::new(self.convert_expression(e)),
-            }),
-        }
-    }
-
     fn convert_object_expression_property(
         &self,
-        prop: &babel_expr::ObjectExpressionProperty,
-    ) -> PropOrSpread {
+        prop: &ObjectExpressionProperty,
+    ) -> swc::PropOrSpread {
         match prop {
-            babel_expr::ObjectExpressionProperty::ObjectProperty(p) => {
-                let key = if p.computed {
-                    // Computed property key: [expr]
-                    PropName::Computed(ComputedPropName {
-                        span: DUMMY_SP,
-                        expr: Box::new(self.convert_expression(&p.key)),
-                    })
-                } else {
-                    self.convert_expression_to_prop_name(&p.key)
-                };
-                let value = self.convert_expression(&p.value);
-                let method = p.method.unwrap_or(false);
-
-                if p.shorthand {
-                    PropOrSpread::Prop(Box::new(Prop::Shorthand(match &*p.key {
-                        BabelExpr::Identifier(id) => self.ident(&id.name, self.span(&id.base)),
-                        _ => self.ident("__unknown__", DUMMY_SP),
-                    })))
-                } else if method {
-                    // Method shorthand: { foo() {} }
-                    // The value should be a function expression
-                    let func = match value {
-                        Expr::Fn(fn_expr) => *fn_expr.function,
-                        _ => {
-                            // Fallback: wrap in a key-value
-                            return PropOrSpread::Prop(Box::new(Prop::KeyValue(KeyValueProp {
-                                key,
-                                value: Box::new(value),
-                            })));
-                        }
-                    };
-                    PropOrSpread::Prop(Box::new(Prop::Method(MethodProp {
-                        key,
-                        function: Box::new(func),
-                    })))
-                } else {
-                    PropOrSpread::Prop(Box::new(Prop::KeyValue(KeyValueProp {
-                        key,
-                        value: Box::new(value),
-                    })))
+            ObjectExpressionProperty::ObjectProperty(prop) => {
+                if prop.shorthand {
+                    if let Expression::Identifier(id) = prop.key.as_ref() {
+                        return swc::PropOrSpread::Prop(Box::new(swc::Prop::Shorthand(
+                            self.convert_identifier(id),
+                        )));
+                    }
                 }
-            }
-            babel_expr::ObjectExpressionProperty::ObjectMethod(m) => {
-                let key = if m.computed {
-                    PropName::Computed(ComputedPropName {
-                        span: DUMMY_SP,
-                        expr: Box::new(self.convert_expression(&m.key)),
-                    })
-                } else {
-                    self.convert_expression_to_prop_name(&m.key)
+
+                let key = self.convert_expression_as_prop_name(&prop.key, prop.computed);
+                let key_value = swc::KeyValueProp {
+                    key,
+                    value: Box::new(self.convert_expression(&prop.value)),
                 };
-                let func = self.convert_object_method_to_function(m);
-                match m.kind {
-                    babel_expr::ObjectMethodKind::Get => {
-                        PropOrSpread::Prop(Box::new(Prop::Getter(GetterProp {
-                            span: self.span(&m.base),
+                swc::PropOrSpread::Prop(Box::new(swc::Prop::KeyValue(key_value)))
+            }
+            ObjectExpressionProperty::ObjectMethod(method) => {
+                let mut function = self.convert_object_method_to_function(method);
+                if !self.preserved_ast.borrow_mut().load_function(&mut function)
+                    && (Self::patterns_have_type_annotations(&method.params)
+                        || Self::has_type_annotation(method.return_type.as_deref()))
+                {
+                    self.cold_fill_function_types_from_json(
+                        &mut function,
+                        &method.params,
+                        method.return_type.as_deref(),
+                    );
+                }
+                let key = self.convert_expression_as_prop_name(&method.key, method.computed);
+                match method.kind {
+                    ObjectMethodKind::Get => {
+                        swc::PropOrSpread::Prop(Box::new(swc::Prop::Getter(swc::GetterProp {
+                            span: self.span_from_base(&method.base),
                             key,
-                            type_ann: None,
-                            body: func.body,
+                            type_ann: function.return_type,
+                            body: function.body,
                         })))
                     }
-                    babel_expr::ObjectMethodKind::Set => {
-                        let param = func
-                            .params
-                            .into_iter()
-                            .next()
-                            .map(|p| Box::new(p.pat))
-                            .unwrap_or_else(|| {
-                                Box::new(Pat::Ident(self.binding_ident("_", DUMMY_SP)))
-                            });
-                        PropOrSpread::Prop(Box::new(Prop::Setter(SetterProp {
-                            span: self.span(&m.base),
+                    ObjectMethodKind::Set => {
+                        let param = function.params.into_iter().next().map_or_else(
+                            || Box::new(swc::Pat::Invalid(swc::Invalid { span: DUMMY_SP })),
+                            |param| Box::new(param.pat),
+                        );
+                        swc::PropOrSpread::Prop(Box::new(swc::Prop::Setter(swc::SetterProp {
+                            span: self.span_from_base(&method.base),
                             key,
                             this_param: None,
                             param,
-                            body: func.body,
+                            body: function.body,
                         })))
                     }
-                    babel_expr::ObjectMethodKind::Method => {
-                        PropOrSpread::Prop(Box::new(Prop::Method(MethodProp {
+                    ObjectMethodKind::Method => {
+                        swc::PropOrSpread::Prop(Box::new(swc::Prop::Method(swc::MethodProp {
                             key,
-                            function: Box::new(func),
+                            function: Box::new(function),
                         })))
                     }
                 }
             }
-            babel_expr::ObjectExpressionProperty::SpreadElement(s) => {
-                PropOrSpread::Spread(SpreadElement {
-                    dot3_token: self.span(&s.base),
-                    expr: Box::new(self.convert_expression(&s.argument)),
+            ObjectExpressionProperty::SpreadElement(spread) => {
+                swc::PropOrSpread::Spread(swc::SpreadElement {
+                    dot3_token: self.span_from_base(&spread.base),
+                    expr: Box::new(self.convert_expression(&spread.argument)),
                 })
             }
         }
     }
 
-    fn convert_expression_to_prop_name(&self, expr: &BabelExpr) -> PropName {
+    fn convert_expression_as_prop_name(&self, expr: &Expression, computed: bool) -> swc::PropName {
+        if computed {
+            return swc::PropName::Computed(swc::ComputedPropName {
+                span: self.expression_span(expr),
+                expr: Box::new(self.convert_expression(expr)),
+            });
+        }
         match expr {
-            BabelExpr::Identifier(id) => {
-                PropName::Ident(self.ident_name(&id.name, self.span(&id.base)))
+            Expression::Identifier(id) => {
+                swc::PropName::Ident(self.make_ident_name(&id.base, &id.name))
             }
-            BabelExpr::StringLiteral(s) => PropName::Str(Str {
-                span: self.span(&s.base),
-                value: self.wtf8(&s.value),
-                raw: None,
+            Expression::StringLiteral(lit) => swc::PropName::Str(self.convert_string_literal(lit)),
+            Expression::NumericLiteral(lit) => swc::PropName::Num(swc::Number {
+                span: self.span_from_base(&lit.base),
+                value: lit.precise_value(),
+                raw: lit
+                    .extra
+                    .as_ref()
+                    .map(|extra| Atom::from(extra.raw.as_str())),
             }),
-            BabelExpr::NumericLiteral(n) => PropName::Num(Number {
-                span: self.span(&n.base),
-                value: n.value,
-                raw: None,
+            Expression::BigIntLiteral(lit) => swc::PropName::BigInt(swc::BigInt {
+                span: self.span_from_base(&lit.base),
+                value: Box::new(bigint_literal_value(&lit.value).parse().unwrap_or_default()),
+                raw: Some(bigint_literal_raw(&lit.value)),
             }),
-            _ => PropName::Computed(ComputedPropName {
-                span: DUMMY_SP,
+            _ => swc::PropName::Computed(swc::ComputedPropName {
+                span: self.expression_span(expr),
                 expr: Box::new(self.convert_expression(expr)),
             }),
         }
     }
 
-    fn convert_template_literal(&self, tl: &babel_expr::TemplateLiteral) -> Tpl {
-        let quasis = tl
-            .quasis
-            .iter()
-            .map(|q| {
-                let cooked = q.value.cooked.as_ref().map(|c| self.wtf8(c));
-                TplElement {
-                    span: self.span(&q.base),
-                    tail: q.tail,
-                    cooked,
-                    raw: self.atom(&q.value.raw),
-                }
-            })
-            .collect();
-        let exprs = tl
-            .expressions
-            .iter()
-            .map(|e| Box::new(self.convert_expression(e)))
-            .collect();
-        Tpl {
-            span: self.span(&tl.base),
-            exprs,
-            quasis,
+    fn convert_template_literal(&self, tpl: &TemplateLiteral) -> swc::Tpl {
+        swc::Tpl {
+            span: self.span_from_base(&tpl.base),
+            exprs: tpl
+                .expressions
+                .iter()
+                .map(|expr| Box::new(self.convert_expression(expr)))
+                .collect(),
+            quasis: tpl
+                .quasis
+                .iter()
+                .map(|quasi| swc::TplElement {
+                    span: self.span_from_base(&quasi.base),
+                    tail: quasi.tail,
+                    cooked: quasi
+                        .value
+                        .cooked
+                        .as_ref()
+                        .map(|cooked| cooked.as_str().into()),
+                    raw: Atom::from(quasi.value.raw.as_str()),
+                })
+                .collect(),
         }
     }
 
-    // ===== Functions =====
-
-    fn convert_function_declaration(&self, f: &babel_stmt::FunctionDeclaration) -> FnDecl {
-        let ident =
-            f.id.as_ref()
-                .map(|id| self.ident(&id.name, self.span(&id.base)))
-                .unwrap_or_else(|| self.ident("_anonymous", DUMMY_SP));
-        let params = self.convert_params(&f.params);
-        let body = Some(self.convert_block_statement(&f.body));
-        let declare = f.declare.unwrap_or(false);
-        FnDecl {
-            ident,
-            declare,
-            function: Box::new(Function {
-                params,
-                decorators: vec![],
-                span: self.span(&f.base),
-                ctxt: SyntaxContext::empty(),
-                body,
-                is_generator: f.generator,
-                is_async: f.is_async,
-                type_params: None,
-                return_type: None,
-            }),
-        }
-    }
-
-    fn convert_object_method_to_function(&self, m: &babel_expr::ObjectMethod) -> Function {
-        let params = self.convert_params(&m.params);
-        let body = Some(self.convert_block_statement(&m.body));
-        Function {
-            params,
+    fn convert_function_declaration(&self, f: &FunctionDeclaration) -> swc::FnDecl {
+        let mut function = swc::Function {
+            params: f
+                .params
+                .iter()
+                .map(|param| self.convert_pattern_like_as_formal_parameter_omitting_types(param))
+                .collect(),
             decorators: vec![],
-            span: self.span(&m.base),
+            span: self.span_from_base(&f.base),
             ctxt: SyntaxContext::empty(),
-            body,
+            body: Some(self.convert_block_statement(&f.body)),
+            is_generator: f.generator,
+            is_async: f.is_async,
+            type_params: None,
+            return_type: None,
+        };
+        if !self.preserved_ast.borrow_mut().load_function(&mut function)
+            && (Self::patterns_have_type_annotations(&f.params)
+                || Self::has_type_annotation(f.return_type.as_deref()))
+        {
+            self.cold_fill_function_types_from_json(
+                &mut function,
+                &f.params,
+                f.return_type.as_deref(),
+            );
+        }
+        swc::FnDecl {
+            ident: f.id.as_ref().map_or_else(
+                || self.private_ident("__default", &f.base),
+                |id| self.convert_identifier(id),
+            ),
+            declare: f.declare.unwrap_or(false),
+            function: Box::new(function),
+        }
+    }
+
+    fn convert_class_declaration(&self, c: &ClassDeclaration) -> swc::Class {
+        self.make_class(
+            &c.base,
+            c.super_class.as_deref(),
+            &c.body,
+            c.is_abstract.unwrap_or(false),
+        )
+    }
+
+    fn make_class(
+        &self,
+        base: &BaseNode,
+        super_class: Option<&Expression>,
+        body: &ClassBody,
+        is_abstract: bool,
+    ) -> swc::Class {
+        let mut class = swc::Class {
+            span: self.span_from_base(base),
+            ctxt: SyntaxContext::empty(),
+            decorators: vec![],
+            body: self.convert_class_body(body),
+            super_class: super_class.map(|expr| Box::new(self.convert_expression(expr))),
+            is_abstract,
+            type_params: None,
+            super_type_params: None,
+            implements: vec![],
+        };
+
+        self.preserved_ast.borrow_mut().load_class(&mut class);
+
+        class
+    }
+
+    fn convert_function_expression(&self, f: &FunctionExpression) -> swc::Function {
+        let mut function = swc::Function {
+            params: f
+                .params
+                .iter()
+                .map(|param| self.convert_pattern_like_as_formal_parameter_omitting_types(param))
+                .collect(),
+            decorators: vec![],
+            span: self.span_from_base(&f.base),
+            ctxt: SyntaxContext::empty(),
+            body: Some(self.convert_block_statement(&f.body)),
+            is_generator: f.generator,
+            is_async: f.is_async,
+            type_params: None,
+            return_type: None,
+        };
+        if !self.preserved_ast.borrow_mut().load_function(&mut function)
+            && (Self::patterns_have_type_annotations(&f.params)
+                || Self::has_type_annotation(f.return_type.as_deref()))
+        {
+            self.cold_fill_function_types_from_json(
+                &mut function,
+                &f.params,
+                f.return_type.as_deref(),
+            );
+        }
+        function
+    }
+
+    fn convert_object_method_to_function(&self, m: &ObjectMethod) -> swc::Function {
+        swc::Function {
+            params: m
+                .params
+                .iter()
+                .map(|param| self.convert_pattern_like_as_formal_parameter_omitting_types(param))
+                .collect(),
+            decorators: vec![],
+            span: self.span_from_base(&m.base),
+            ctxt: SyntaxContext::empty(),
+            body: Some(self.convert_block_statement(&m.body)),
             is_generator: m.generator,
             is_async: m.is_async,
             type_params: None,
@@ -1517,1189 +1729,1252 @@ impl ReverseCtx {
         }
     }
 
-    fn convert_arrow_function(&self, arrow: &babel_expr::ArrowFunctionExpression) -> Expr {
-        let is_expression = arrow.expression.unwrap_or(false);
-        let params = arrow
-            .params
-            .iter()
-            .map(|p| self.convert_pattern(p))
-            .collect();
-
-        let body: Box<BlockStmtOrExpr> = match &*arrow.body {
-            babel_expr::ArrowFunctionBody::BlockStatement(block) => Box::new(
-                BlockStmtOrExpr::BlockStmt(self.convert_block_statement(block)),
-            ),
-            babel_expr::ArrowFunctionBody::Expression(expr) => {
-                if is_expression {
-                    let converted = self.convert_expression(expr);
-                    // Wrap object expressions in parens to prevent ambiguity
-                    // with block bodies: `() => ({...})` vs `() => {...}`
-                    let converted = if matches!(&converted, Expr::Object(_)) {
-                        Expr::Paren(ParenExpr {
-                            span: converted.span(),
-                            expr: Box::new(converted),
-                        })
-                    } else {
-                        converted
-                    };
-                    Box::new(BlockStmtOrExpr::Expr(Box::new(converted)))
-                } else {
-                    // Wrap in block with return
-                    let ret_stmt = Stmt::Return(ReturnStmt {
-                        span: DUMMY_SP,
-                        arg: Some(Box::new(self.convert_expression(expr))),
-                    });
-                    Box::new(BlockStmtOrExpr::BlockStmt(BlockStmt {
-                        span: DUMMY_SP,
-                        ctxt: SyntaxContext::empty(),
-                        stmts: vec![ret_stmt],
-                    }))
-                }
-            }
-        };
-
-        Expr::Arrow(ArrowExpr {
-            span: self.span(&arrow.base),
+    fn convert_arrow_function_expression(&self, arrow: &ArrowFunctionExpression) -> swc::Expr {
+        let mut arrow_expr = swc::ArrowExpr {
+            span: self.span_from_base(&arrow.base),
             ctxt: SyntaxContext::empty(),
-            params,
-            body,
+            params: arrow
+                .params
+                .iter()
+                .map(|param| self.convert_pattern_like_omitting_types(param))
+                .collect(),
+            body: Box::new(match arrow.body.as_ref() {
+                ArrowFunctionBody::BlockStatement(block) => {
+                    swc::BlockStmtOrExpr::BlockStmt(self.convert_block_statement(block))
+                }
+                ArrowFunctionBody::Expression(expr) => {
+                    swc::BlockStmtOrExpr::Expr(Box::new(self.convert_expression(expr)))
+                }
+            }),
             is_async: arrow.is_async,
             is_generator: arrow.generator,
-            return_type: None,
             type_params: None,
+            return_type: None,
+        };
+        if !self.preserved_ast.borrow_mut().load_arrow(&mut arrow_expr)
+            && (Self::patterns_have_type_annotations(&arrow.params)
+                || Self::has_type_annotation(arrow.return_type.as_deref()))
+        {
+            self.cold_fill_arrow_types_from_json(
+                &mut arrow_expr,
+                &arrow.params,
+                arrow.return_type.as_deref(),
+            );
+        }
+
+        swc::Expr::Arrow(arrow_expr)
+    }
+
+    fn convert_pattern_like_as_formal_parameter(&self, param: &PatternLike) -> swc::Param {
+        self.convert_pattern_like_as_formal_parameter_with_mode(param, PatternTypeAnnMode::FromJson)
+    }
+
+    fn convert_pattern_like_as_formal_parameter_omitting_types(
+        &self,
+        param: &PatternLike,
+    ) -> swc::Param {
+        self.convert_pattern_like_as_formal_parameter_with_mode(param, PatternTypeAnnMode::Omit)
+    }
+
+    fn convert_pattern_like_as_formal_parameter_with_mode(
+        &self,
+        param: &PatternLike,
+        type_ann_mode: PatternTypeAnnMode,
+    ) -> swc::Param {
+        swc::Param {
+            span: self.pattern_span(param),
+            decorators: vec![],
+            pat: self.convert_pattern_like_with_type_ann_mode(param, type_ann_mode),
+        }
+    }
+
+    fn pattern_type_annotation(
+        &self,
+        pattern: &PatternLike,
+        type_ann_mode: PatternTypeAnnMode,
+    ) -> Option<Box<swc::TsTypeAnn>> {
+        match type_ann_mode {
+            PatternTypeAnnMode::FromJson => self.cold_pattern_type_annotation_from_json(pattern),
+            PatternTypeAnnMode::Omit => None,
+        }
+    }
+
+    #[cold]
+    fn cold_pattern_type_annotation_from_json(
+        &self,
+        pattern: &PatternLike,
+    ) -> Option<Box<swc::TsTypeAnn>> {
+        match pattern {
+            PatternLike::Identifier(id) => {
+                self.convert_ts_type_annotation_option(id.type_annotation.as_deref())
+            }
+            PatternLike::ObjectPattern(pattern) => {
+                self.convert_ts_type_annotation_option(pattern.type_annotation.as_deref())
+            }
+            PatternLike::ArrayPattern(pattern) => {
+                self.convert_ts_type_annotation_option(pattern.type_annotation.as_deref())
+            }
+            PatternLike::AssignmentPattern(pattern) => {
+                self.convert_ts_type_annotation_option(pattern.type_annotation.as_deref())
+            }
+            PatternLike::RestElement(pattern) => {
+                self.convert_ts_type_annotation_option(pattern.type_annotation.as_deref())
+            }
+            _ => None,
+        }
+    }
+
+    fn convert_pattern_like(&self, pattern: &PatternLike) -> swc::Pat {
+        self.convert_pattern_like_with_type_ann_mode(pattern, PatternTypeAnnMode::FromJson)
+    }
+
+    fn convert_pattern_like_omitting_types(&self, pattern: &PatternLike) -> swc::Pat {
+        self.convert_pattern_like_with_type_ann_mode(pattern, PatternTypeAnnMode::Omit)
+    }
+
+    fn convert_pattern_like_with_type_ann_mode(
+        &self,
+        pattern: &PatternLike,
+        type_ann_mode: PatternTypeAnnMode,
+    ) -> swc::Pat {
+        match pattern {
+            PatternLike::Identifier(id) => swc::Pat::Ident(swc::BindingIdent {
+                id: self.convert_identifier(id),
+                type_ann: self.pattern_type_annotation(pattern, type_ann_mode),
+            }),
+            PatternLike::ObjectPattern(obj) => swc::Pat::Object(swc::ObjectPat {
+                span: self.span_from_base(&obj.base),
+                props: obj
+                    .properties
+                    .iter()
+                    .map(|prop| self.convert_object_pattern_property(prop, type_ann_mode))
+                    .collect(),
+                optional: false,
+                type_ann: self.pattern_type_annotation(pattern, type_ann_mode),
+            }),
+            PatternLike::ArrayPattern(arr) => swc::Pat::Array(swc::ArrayPat {
+                span: self.span_from_base(&arr.base),
+                elems: arr
+                    .elements
+                    .iter()
+                    .map(|elem| {
+                        elem.as_ref().map(|elem| {
+                            self.convert_pattern_like_with_type_ann_mode(elem, type_ann_mode)
+                        })
+                    })
+                    .collect(),
+                optional: false,
+                type_ann: self.pattern_type_annotation(pattern, type_ann_mode),
+            }),
+            PatternLike::AssignmentPattern(assign) => swc::Pat::Assign(swc::AssignPat {
+                span: self.span_from_base(&assign.base),
+                left: Box::new(
+                    self.convert_pattern_like_with_type_ann_mode(&assign.left, type_ann_mode),
+                ),
+                right: Box::new(self.convert_expression(&assign.right)),
+            }),
+            PatternLike::RestElement(rest) => swc::Pat::Rest(swc::RestPat {
+                span: self.span_from_base(&rest.base),
+                dot3_token: self.span_from_base(&rest.base),
+                arg: Box::new(
+                    self.convert_pattern_like_with_type_ann_mode(&rest.argument, type_ann_mode),
+                ),
+                type_ann: self.pattern_type_annotation(pattern, type_ann_mode),
+            }),
+            PatternLike::MemberExpression(member) => {
+                swc::Pat::Expr(Box::new(self.convert_member_expression(member)))
+            }
+            PatternLike::TSAsExpression(ts) => swc::Pat::Expr(Box::new(
+                self.convert_expression(&Expression::TSAsExpression(ts.clone())),
+            )),
+            PatternLike::TSSatisfiesExpression(ts) => swc::Pat::Expr(Box::new(
+                self.convert_expression(&Expression::TSSatisfiesExpression(ts.clone())),
+            )),
+            PatternLike::TSNonNullExpression(ts) => swc::Pat::Expr(Box::new(
+                self.convert_expression(&Expression::TSNonNullExpression(ts.clone())),
+            )),
+            PatternLike::TSTypeAssertion(ts) => swc::Pat::Expr(Box::new(
+                self.convert_expression(&Expression::TSTypeAssertion(ts.clone())),
+            )),
+            PatternLike::TypeCastExpression(type_cast) => self
+                .convert_pattern_like_with_type_ann_mode(
+                    &PatternLike::TSAsExpression(TSAsExpression {
+                        base: type_cast.base.clone(),
+                        expression: type_cast.expression.clone(),
+                        type_annotation: type_cast.type_annotation.clone(),
+                    }),
+                    type_ann_mode,
+                ),
+        }
+    }
+
+    fn convert_object_pattern_property(
+        &self,
+        prop: &ObjectPatternProperty,
+        type_ann_mode: PatternTypeAnnMode,
+    ) -> swc::ObjectPatProp {
+        match prop {
+            ObjectPatternProperty::ObjectProperty(prop) => {
+                self.convert_object_pattern_prop(prop, type_ann_mode)
+            }
+            ObjectPatternProperty::RestElement(rest) => {
+                self.convert_rest_element_as_object_pat_prop(rest, type_ann_mode)
+            }
+        }
+    }
+
+    fn convert_object_pattern_prop(
+        &self,
+        prop: &ObjectPatternProp,
+        type_ann_mode: PatternTypeAnnMode,
+    ) -> swc::ObjectPatProp {
+        if prop.shorthand {
+            if let Expression::Identifier(key) = prop.key.as_ref() {
+                match prop.value.as_ref() {
+                    PatternLike::Identifier(id) if id.name == key.name => {
+                        return swc::ObjectPatProp::Assign(swc::AssignPatProp {
+                            span: self.span_from_base(&prop.base),
+                            key: swc::BindingIdent {
+                                id: self.convert_identifier(id),
+                                type_ann: self.pattern_type_annotation(&prop.value, type_ann_mode),
+                            },
+                            value: None,
+                        });
+                    }
+                    PatternLike::AssignmentPattern(assign) => match assign.left.as_ref() {
+                        PatternLike::Identifier(id) if id.name == key.name => {
+                            return swc::ObjectPatProp::Assign(swc::AssignPatProp {
+                                span: self.span_from_base(&prop.base),
+                                key: swc::BindingIdent {
+                                    id: self.convert_identifier(id),
+                                    type_ann: self
+                                        .pattern_type_annotation(&assign.left, type_ann_mode),
+                                },
+                                value: Some(Box::new(self.convert_expression(&assign.right))),
+                            });
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        swc::ObjectPatProp::KeyValue(swc::KeyValuePatProp {
+            key: self.convert_expression_as_prop_name(&prop.key, prop.computed),
+            value: Box::new(
+                self.convert_pattern_like_with_type_ann_mode(&prop.value, type_ann_mode),
+            ),
         })
     }
 
-    fn convert_params(&self, params: &[PatternLike]) -> Vec<Param> {
-        params
-            .iter()
-            .map(|p| Param {
-                span: DUMMY_SP,
-                decorators: vec![],
-                pat: self.convert_pattern(p),
-            })
-            .collect()
-    }
-
-    // ===== Patterns =====
-
-    fn convert_pattern(&self, pattern: &PatternLike) -> Pat {
-        match pattern {
-            PatternLike::Identifier(id) => {
-                let mut bi = self.binding_ident(&id.name, self.span(&id.base));
-                bi.id.optional = id.optional.unwrap_or(false);
-                // Preserve type annotations if present
-                if let Some(ref type_ann) = id.type_annotation {
-                    bi.type_ann =
-                        self.convert_ts_type_annotation_from_json(&type_ann.parse_value());
-                }
-                Pat::Ident(bi)
-            }
-            PatternLike::ObjectPattern(obj) => {
-                let mut props: Vec<ObjectPatProp> = Vec::new();
-
-                for prop in &obj.properties {
-                    match prop {
-                        ObjectPatternProperty::ObjectProperty(p) => {
-                            if p.shorthand {
-                                // Shorthand: { x } or { x = default }
-                                let value = self.convert_pattern(&p.value);
-                                match &*p.key {
-                                    BabelExpr::Identifier(id) => {
-                                        let key_ident =
-                                            self.binding_ident(&id.name, self.span(&id.base));
-                                        match value {
-                                            Pat::Assign(assign_pat) => {
-                                                props.push(ObjectPatProp::Assign(AssignPatProp {
-                                                    span: self.span(&p.base),
-                                                    key: key_ident,
-                                                    value: Some(assign_pat.right),
-                                                }));
-                                            }
-                                            _ => {
-                                                props.push(ObjectPatProp::Assign(AssignPatProp {
-                                                    span: self.span(&p.base),
-                                                    key: key_ident,
-                                                    value: None,
-                                                }));
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        // Fallback to key-value
-                                        let key = self.convert_expression_to_prop_name(&p.key);
-                                        props.push(ObjectPatProp::KeyValue(KeyValuePatProp {
-                                            key,
-                                            value: Box::new(value),
-                                        }));
-                                    }
-                                }
-                            } else {
-                                let key = self.convert_expression_to_prop_name(&p.key);
-                                let value = self.convert_pattern(&p.value);
-                                props.push(ObjectPatProp::KeyValue(KeyValuePatProp {
-                                    key,
-                                    value: Box::new(value),
-                                }));
-                            }
-                        }
-                        ObjectPatternProperty::RestElement(r) => {
-                            let arg = Box::new(self.convert_pattern(&r.argument));
-                            props.push(ObjectPatProp::Rest(RestPat {
-                                span: self.span(&r.base),
-                                dot3_token: self.span(&r.base),
-                                arg,
-                                type_ann: None,
-                            }));
-                        }
-                    }
-                }
-
-                Pat::Object(ObjectPat {
-                    span: self.span(&obj.base),
-                    props,
-                    optional: false,
-                    type_ann: None,
-                })
-            }
-            PatternLike::ArrayPattern(arr) => {
-                let elems = arr
-                    .elements
-                    .iter()
-                    .map(|e| e.as_ref().map(|p| self.convert_pattern(p)))
-                    .collect();
-                Pat::Array(ArrayPat {
-                    span: self.span(&arr.base),
-                    elems,
-                    optional: false,
-                    type_ann: None,
-                })
-            }
-            PatternLike::AssignmentPattern(ap) => {
-                let left = Box::new(self.convert_pattern(&ap.left));
-                let right = Box::new(self.convert_expression(&ap.right));
-                Pat::Assign(AssignPat {
-                    span: self.span(&ap.base),
-                    left,
-                    right,
-                })
-            }
-            PatternLike::RestElement(r) => {
-                let arg = Box::new(self.convert_pattern(&r.argument));
-                Pat::Rest(RestPat {
-                    span: self.span(&r.base),
-                    dot3_token: self.span(&r.base),
-                    arg,
-                    type_ann: None,
-                })
-            }
-            PatternLike::MemberExpression(m) => {
-                // MemberExpression in pattern position - convert to an expression pattern
-                Pat::Expr(Box::new(self.convert_member_expression(m)))
-            }
-            // TS wrappers in pattern position: strip the type wrapper, keep the
-            // inner expression (unreachable for unsupported targets; non-panicking).
-            PatternLike::TSAsExpression(e) => {
-                Pat::Expr(Box::new(self.convert_expression(&e.expression)))
-            }
-            PatternLike::TSSatisfiesExpression(e) => {
-                Pat::Expr(Box::new(self.convert_expression(&e.expression)))
-            }
-            PatternLike::TSNonNullExpression(e) => {
-                Pat::Expr(Box::new(self.convert_expression(&e.expression)))
-            }
-            PatternLike::TSTypeAssertion(e) => {
-                Pat::Expr(Box::new(self.convert_expression(&e.expression)))
-            }
-            PatternLike::TypeCastExpression(e) => {
-                Pat::Expr(Box::new(self.convert_expression(&e.expression)))
-            }
-        }
-    }
-
-    // ===== Patterns → AssignmentTarget =====
-
-    fn convert_pattern_to_assign_target(&self, pattern: &PatternLike) -> AssignTarget {
-        match pattern {
-            PatternLike::Identifier(id) => AssignTarget::Simple(SimpleAssignTarget::Ident(
-                self.binding_ident(&id.name, self.span(&id.base)),
-            )),
-            PatternLike::MemberExpression(m) => {
-                let expr = self.convert_member_expression(m);
-                match expr {
-                    Expr::Member(member) => {
-                        AssignTarget::Simple(SimpleAssignTarget::Member(member))
-                    }
-                    _ => AssignTarget::Simple(SimpleAssignTarget::Ident(
-                        self.binding_ident("__unknown__", DUMMY_SP),
-                    )),
-                }
-            }
-            PatternLike::ObjectPattern(_obj) => {
-                let pat = self.convert_pattern(pattern);
-                match pat {
-                    Pat::Object(obj_pat) => AssignTarget::Pat(AssignTargetPat::Object(obj_pat)),
-                    _ => AssignTarget::Simple(SimpleAssignTarget::Ident(
-                        self.binding_ident("__unknown__", DUMMY_SP),
-                    )),
-                }
-            }
-            PatternLike::ArrayPattern(_arr) => {
-                let pat = self.convert_pattern(pattern);
-                match pat {
-                    Pat::Array(arr_pat) => AssignTarget::Pat(AssignTargetPat::Array(arr_pat)),
-                    _ => AssignTarget::Simple(SimpleAssignTarget::Ident(
-                        self.binding_ident("__unknown__", DUMMY_SP),
-                    )),
-                }
-            }
-            PatternLike::AssignmentPattern(ap) => {
-                // For assignment LHS, use the left side
-                self.convert_pattern_to_assign_target(&ap.left)
-            }
-            PatternLike::RestElement(r) => self.convert_pattern_to_assign_target(&r.argument),
-            PatternLike::TSAsExpression(_)
-            | PatternLike::TSSatisfiesExpression(_)
-            | PatternLike::TSNonNullExpression(_)
-            | PatternLike::TSTypeAssertion(_)
-            | PatternLike::TypeCastExpression(_) => AssignTarget::Simple(
-                SimpleAssignTarget::Ident(self.binding_ident("__unknown__", DUMMY_SP)),
-            ),
-        }
-    }
-
-    // ===== JSX =====
-
-    fn convert_jsx_element(
+    fn convert_rest_element_as_object_pat_prop(
         &self,
-        el: &react_compiler_ast::jsx::JSXElement,
-    ) -> swc_ecma_ast::JSXElement {
-        let opening = self.convert_jsx_opening_element(&el.opening_element);
-        let children: Vec<swc_ecma_ast::JSXElementChild> = el
-            .children
-            .iter()
-            .map(|c| self.convert_jsx_child(c))
-            .collect();
-        let closing = el
-            .closing_element
-            .as_ref()
-            .map(|c| self.convert_jsx_closing_element(c));
-        swc_ecma_ast::JSXElement {
-            span: self.span(&el.base),
-            opening,
-            children,
-            closing,
+        rest: &RestElement,
+        type_ann_mode: PatternTypeAnnMode,
+    ) -> swc::ObjectPatProp {
+        let swc::Pat::Rest(rest) = self.convert_pattern_like_with_type_ann_mode(
+            &PatternLike::RestElement(rest.clone()),
+            type_ann_mode,
+        ) else {
+            return swc::ObjectPatProp::Rest(swc::RestPat {
+                span: self.span_from_base(&rest.base),
+                dot3_token: self.span_from_base(&rest.base),
+                arg: Box::new(swc::Pat::Invalid(swc::Invalid { span: DUMMY_SP })),
+                type_ann: None,
+            });
+        };
+        swc::ObjectPatProp::Rest(rest)
+    }
+
+    fn convert_pattern_like_as_assign_target(&self, pattern: &PatternLike) -> swc::AssignTarget {
+        match self.convert_pattern_like(pattern).try_into() {
+            Ok(target) => target,
+            Err(pattern) => match pattern {
+                swc::Pat::Expr(expr) => expr.try_into().unwrap_or_else(|expr: Box<swc::Expr>| {
+                    swc::SimpleAssignTarget::Invalid(swc::Invalid { span: expr.span() }).into()
+                }),
+                _ => swc::AssignTarget::Pat(
+                    swc::AssignTargetPat::try_from(pattern).unwrap_or_else(|pattern| {
+                        swc::AssignTargetPat::Invalid(swc::Invalid {
+                            span: pattern.span(),
+                        })
+                    }),
+                ),
+            },
         }
     }
 
-    fn convert_jsx_opening_element(
-        &self,
-        el: &react_compiler_ast::jsx::JSXOpeningElement,
-    ) -> swc_ecma_ast::JSXOpeningElement {
-        let name = self.convert_jsx_element_name(&el.name);
-        let attrs = el
-            .attributes
-            .iter()
-            .map(|a| self.convert_jsx_attribute_item(a))
-            .collect();
-        swc_ecma_ast::JSXOpeningElement {
-            span: self.span(&el.base),
-            name,
-            attrs,
+    fn convert_jsx_element(&self, el: &JSXElement) -> swc::JSXElement {
+        swc::JSXElement {
+            span: self.span_from_base(&el.base),
+            opening: self.convert_jsx_opening_element(&el.opening_element),
+            children: el
+                .children
+                .iter()
+                .map(|child| self.convert_jsx_child(child))
+                .collect(),
+            closing: el
+                .closing_element
+                .as_ref()
+                .map(|closing| self.convert_jsx_closing_element(closing)),
+        }
+    }
+
+    fn convert_jsx_opening_element(&self, el: &JSXOpeningElement) -> swc::JSXOpeningElement {
+        let mut opening = swc::JSXOpeningElement {
+            name: self.convert_jsx_element_name(&el.name),
+            span: self.span_from_base(&el.base),
+            attrs: el
+                .attributes
+                .iter()
+                .map(|attr| self.convert_jsx_attribute_item(attr))
+                .collect(),
             self_closing: el.self_closing,
             type_args: None,
+        };
+        if !self
+            .preserved_ast
+            .borrow_mut()
+            .load_jsx_opening_element(&mut opening)
+            && Self::has_type_annotation(el.type_parameters.as_deref())
+        {
+            self.cold_fill_jsx_opening_type_args_from_json(
+                &mut opening,
+                el.type_parameters.as_deref(),
+            );
+        }
+        opening
+    }
+
+    fn convert_jsx_closing_element(&self, el: &JSXClosingElement) -> swc::JSXClosingElement {
+        swc::JSXClosingElement {
+            span: self.span_from_base(&el.base),
+            name: self.convert_jsx_element_name(&el.name),
         }
     }
 
-    fn convert_jsx_closing_element(
-        &self,
-        el: &react_compiler_ast::jsx::JSXClosingElement,
-    ) -> swc_ecma_ast::JSXClosingElement {
-        let name = self.convert_jsx_element_name(&el.name);
-        swc_ecma_ast::JSXClosingElement {
-            span: self.span(&el.base),
-            name,
-        }
-    }
-
-    fn convert_jsx_element_name(
-        &self,
-        name: &react_compiler_ast::jsx::JSXElementName,
-    ) -> swc_ecma_ast::JSXElementName {
+    fn convert_jsx_element_name(&self, name: &JSXElementName) -> swc::JSXElementName {
         match name {
-            react_compiler_ast::jsx::JSXElementName::JSXIdentifier(id) => {
-                swc_ecma_ast::JSXElementName::Ident(self.ident(&id.name, self.span(&id.base)))
+            JSXElementName::JSXIdentifier(id) => {
+                swc::JSXElementName::Ident(self.convert_jsx_identifier(id))
             }
-            react_compiler_ast::jsx::JSXElementName::JSXMemberExpression(m) => {
-                let member = self.convert_jsx_member_expression(m);
-                swc_ecma_ast::JSXElementName::JSXMemberExpr(member)
+            JSXElementName::JSXMemberExpression(member) => {
+                swc::JSXElementName::JSXMemberExpr(self.convert_jsx_member_expression(member))
             }
-            react_compiler_ast::jsx::JSXElementName::JSXNamespacedName(ns) => {
-                let namespace = self.ident_name(&ns.namespace.name, self.span(&ns.namespace.base));
-                let name = self.ident_name(&ns.name.name, self.span(&ns.name.base));
-                swc_ecma_ast::JSXElementName::JSXNamespacedName(swc_ecma_ast::JSXNamespacedName {
-                    span: DUMMY_SP,
-                    ns: namespace,
-                    name,
+            JSXElementName::JSXNamespacedName(ns) => {
+                swc::JSXElementName::JSXNamespacedName(swc::JSXNamespacedName {
+                    span: self.span_from_base(&ns.base),
+                    ns: self.make_ident_name(&ns.namespace.base, &ns.namespace.name),
+                    name: self.make_ident_name(&ns.name.base, &ns.name.name),
                 })
             }
         }
     }
 
-    fn convert_jsx_member_expression(
-        &self,
-        m: &react_compiler_ast::jsx::JSXMemberExpression,
-    ) -> swc_ecma_ast::JSXMemberExpr {
-        let obj = self.convert_jsx_member_expression_object(&m.object);
-        let prop = self.ident_name(&m.property.name, self.span(&m.property.base));
-        swc_ecma_ast::JSXMemberExpr {
-            span: DUMMY_SP,
-            obj,
-            prop,
+    fn convert_jsx_member_expression(&self, expr: &JSXMemberExpression) -> swc::JSXMemberExpr {
+        swc::JSXMemberExpr {
+            span: self.span_from_base(&expr.base),
+            obj: self.convert_jsx_member_expr_object(&expr.object),
+            prop: self.make_ident_name(&expr.property.base, &expr.property.name),
         }
     }
 
-    fn convert_jsx_member_expression_object(
-        &self,
-        obj: &react_compiler_ast::jsx::JSXMemberExprObject,
-    ) -> swc_ecma_ast::JSXObject {
-        match obj {
-            react_compiler_ast::jsx::JSXMemberExprObject::JSXIdentifier(id) => {
-                swc_ecma_ast::JSXObject::Ident(self.ident(&id.name, self.span(&id.base)))
+    fn convert_jsx_member_expr_object(&self, object: &JSXMemberExprObject) -> swc::JSXObject {
+        match object {
+            JSXMemberExprObject::JSXIdentifier(id) => {
+                swc::JSXObject::Ident(self.convert_jsx_identifier(id))
             }
-            react_compiler_ast::jsx::JSXMemberExprObject::JSXMemberExpression(m) => {
-                let member = self.convert_jsx_member_expression(m);
-                swc_ecma_ast::JSXObject::JSXMemberExpr(Box::new(member))
+            JSXMemberExprObject::JSXMemberExpression(member) => {
+                swc::JSXObject::JSXMemberExpr(Box::new(self.convert_jsx_member_expression(member)))
             }
         }
     }
 
-    fn convert_jsx_attribute_item(
-        &self,
-        item: &react_compiler_ast::jsx::JSXAttributeItem,
-    ) -> swc_ecma_ast::JSXAttrOrSpread {
+    fn convert_jsx_attribute_item(&self, item: &JSXAttributeItem) -> swc::JSXAttrOrSpread {
         match item {
-            react_compiler_ast::jsx::JSXAttributeItem::JSXAttribute(attr) => {
-                let name = self.convert_jsx_attribute_name(&attr.name);
-                let value = attr
+            JSXAttributeItem::JSXAttribute(attr) => swc::JSXAttrOrSpread::JSXAttr(swc::JSXAttr {
+                span: self.span_from_base(&attr.base),
+                name: self.convert_jsx_attribute_name(&attr.name),
+                value: attr
                     .value
                     .as_ref()
-                    .map(|v| self.convert_jsx_attribute_value(v));
-                swc_ecma_ast::JSXAttrOrSpread::JSXAttr(swc_ecma_ast::JSXAttr {
-                    span: self.span(&attr.base),
-                    name,
-                    value,
-                })
-            }
-            react_compiler_ast::jsx::JSXAttributeItem::JSXSpreadAttribute(s) => {
-                swc_ecma_ast::JSXAttrOrSpread::SpreadElement(SpreadElement {
-                    dot3_token: self.span(&s.base),
-                    expr: Box::new(self.convert_expression(&s.argument)),
+                    .map(|value| self.convert_jsx_attribute_value(value)),
+            }),
+            JSXAttributeItem::JSXSpreadAttribute(spread) => {
+                swc::JSXAttrOrSpread::SpreadElement(swc::SpreadElement {
+                    dot3_token: self.span_from_base(&spread.base),
+                    expr: Box::new(self.convert_expression(&spread.argument)),
                 })
             }
         }
     }
 
-    fn convert_jsx_attribute_name(
-        &self,
-        name: &react_compiler_ast::jsx::JSXAttributeName,
-    ) -> swc_ecma_ast::JSXAttrName {
+    fn convert_jsx_attribute_name(&self, name: &JSXAttributeName) -> swc::JSXAttrName {
         match name {
-            react_compiler_ast::jsx::JSXAttributeName::JSXIdentifier(id) => {
-                swc_ecma_ast::JSXAttrName::Ident(self.ident_name(&id.name, self.span(&id.base)))
+            JSXAttributeName::JSXIdentifier(id) => {
+                swc::JSXAttrName::Ident(self.make_ident_name(&id.base, &id.name))
             }
-            react_compiler_ast::jsx::JSXAttributeName::JSXNamespacedName(ns) => {
-                let namespace = self.ident_name(&ns.namespace.name, self.span(&ns.namespace.base));
-                let name = self.ident_name(&ns.name.name, self.span(&ns.name.base));
-                swc_ecma_ast::JSXAttrName::JSXNamespacedName(swc_ecma_ast::JSXNamespacedName {
-                    span: DUMMY_SP,
-                    ns: namespace,
-                    name,
+            JSXAttributeName::JSXNamespacedName(ns) => {
+                swc::JSXAttrName::JSXNamespacedName(swc::JSXNamespacedName {
+                    span: self.span_from_base(&ns.base),
+                    ns: self.make_ident_name(&ns.namespace.base, &ns.namespace.name),
+                    name: self.make_ident_name(&ns.name.base, &ns.name.name),
                 })
             }
         }
     }
 
-    fn convert_jsx_attribute_value(
-        &self,
-        value: &react_compiler_ast::jsx::JSXAttributeValue,
-    ) -> swc_ecma_ast::JSXAttrValue {
+    fn convert_jsx_attribute_value(&self, value: &JSXAttributeValue) -> swc::JSXAttrValue {
         match value {
-            react_compiler_ast::jsx::JSXAttributeValue::StringLiteral(s) => {
-                // For JSX attributes, if the value contains double quotes,
-                // use single quotes to avoid escaping issues that prettier
-                // can't parse (e.g., name="\"user\" name").
-                let raw = if s.value.contains('"') {
-                    Some(Atom::from(format!(
-                        "'{}'",
-                        s.value.replace('\\', "\\\\").replace('\'', "\\'")
-                    )))
-                } else {
-                    self.escape_string_raw(&s.value)
-                };
-                swc_ecma_ast::JSXAttrValue::Str(Str {
-                    span: self.span(&s.base),
-                    value: self.wtf8(&s.value),
-                    raw,
+            JSXAttributeValue::StringLiteral(lit) => {
+                swc::JSXAttrValue::Str(self.convert_string_literal(lit))
+            }
+            JSXAttributeValue::JSXExpressionContainer(container) => {
+                swc::JSXAttrValue::JSXExprContainer(swc::JSXExprContainer {
+                    span: self.span_from_base(&container.base),
+                    expr: self.convert_jsx_expression_container_expr(&container.expression),
                 })
             }
-            react_compiler_ast::jsx::JSXAttributeValue::JSXExpressionContainer(ec) => {
-                let expr = self.convert_jsx_expression_container_expr(&ec.expression);
-                swc_ecma_ast::JSXAttrValue::JSXExprContainer(swc_ecma_ast::JSXExprContainer {
-                    span: self.span(&ec.base),
-                    expr,
-                })
+            JSXAttributeValue::JSXElement(el) => {
+                swc::JSXAttrValue::JSXElement(Box::new(self.convert_jsx_element(el)))
             }
-            react_compiler_ast::jsx::JSXAttributeValue::JSXElement(el) => {
-                let element = self.convert_jsx_element(el.as_ref());
-                swc_ecma_ast::JSXAttrValue::JSXElement(Box::new(element))
-            }
-            react_compiler_ast::jsx::JSXAttributeValue::JSXFragment(frag) => {
-                let fragment = self.convert_jsx_fragment(frag);
-                swc_ecma_ast::JSXAttrValue::JSXFragment(fragment)
+            JSXAttributeValue::JSXFragment(frag) => {
+                swc::JSXAttrValue::JSXFragment(self.convert_jsx_fragment(frag))
             }
         }
     }
 
     fn convert_jsx_expression_container_expr(
         &self,
-        expr: &react_compiler_ast::jsx::JSXExpressionContainerExpr,
-    ) -> swc_ecma_ast::JSXExpr {
+        expr: &JSXExpressionContainerExpr,
+    ) -> swc::JSXExpr {
         match expr {
-            react_compiler_ast::jsx::JSXExpressionContainerExpr::JSXEmptyExpression(e) => {
-                swc_ecma_ast::JSXExpr::JSXEmptyExpr(swc_ecma_ast::JSXEmptyExpr {
-                    span: self.span(&e.base),
+            JSXExpressionContainerExpr::JSXEmptyExpression(empty) => {
+                swc::JSXExpr::JSXEmptyExpr(swc::JSXEmptyExpr {
+                    span: self.span_from_base(&empty.base),
                 })
             }
-            react_compiler_ast::jsx::JSXExpressionContainerExpr::Expression(e) => {
-                swc_ecma_ast::JSXExpr::Expr(Box::new(self.convert_expression(e)))
+            JSXExpressionContainerExpr::Expression(expr) => {
+                swc::JSXExpr::Expr(Box::new(self.convert_expression(expr)))
             }
         }
     }
 
-    fn convert_jsx_child(
-        &self,
-        child: &react_compiler_ast::jsx::JSXChild,
-    ) -> swc_ecma_ast::JSXElementChild {
+    fn convert_jsx_child(&self, child: &JSXChild) -> swc::JSXElementChild {
         match child {
-            react_compiler_ast::jsx::JSXChild::JSXText(t) => {
-                swc_ecma_ast::JSXElementChild::JSXText(swc_ecma_ast::JSXText {
-                    span: self.span(&t.base),
-                    value: self.atom(&t.value),
-                    raw: self.atom(&t.value),
+            JSXChild::JSXElement(el) => {
+                swc::JSXElementChild::JSXElement(Box::new(self.convert_jsx_element(el)))
+            }
+            JSXChild::JSXFragment(frag) => {
+                swc::JSXElementChild::JSXFragment(self.convert_jsx_fragment(frag))
+            }
+            JSXChild::JSXExpressionContainer(container) => {
+                swc::JSXElementChild::JSXExprContainer(swc::JSXExprContainer {
+                    span: self.span_from_base(&container.base),
+                    expr: self.convert_jsx_expression_container_expr(&container.expression),
                 })
             }
-            react_compiler_ast::jsx::JSXChild::JSXElement(el) => {
-                let element = self.convert_jsx_element(el.as_ref());
-                swc_ecma_ast::JSXElementChild::JSXElement(Box::new(element))
-            }
-            react_compiler_ast::jsx::JSXChild::JSXFragment(frag) => {
-                let fragment = self.convert_jsx_fragment(frag);
-                swc_ecma_ast::JSXElementChild::JSXFragment(fragment)
-            }
-            react_compiler_ast::jsx::JSXChild::JSXExpressionContainer(ec) => {
-                let expr = self.convert_jsx_expression_container_expr(&ec.expression);
-                swc_ecma_ast::JSXElementChild::JSXExprContainer(swc_ecma_ast::JSXExprContainer {
-                    span: self.span(&ec.base),
-                    expr,
+            JSXChild::JSXSpreadChild(spread) => {
+                swc::JSXElementChild::JSXSpreadChild(swc::JSXSpreadChild {
+                    span: self.span_from_base(&spread.base),
+                    expr: Box::new(self.convert_expression(&spread.expression)),
                 })
             }
-            react_compiler_ast::jsx::JSXChild::JSXSpreadChild(s) => {
-                swc_ecma_ast::JSXElementChild::JSXSpreadChild(swc_ecma_ast::JSXSpreadChild {
-                    span: self.span(&s.base),
-                    expr: Box::new(self.convert_expression(&s.expression)),
-                })
-            }
+            JSXChild::JSXText(text) => swc::JSXElementChild::JSXText(swc::JSXText {
+                span: self.span_from_base(&text.base),
+                value: Atom::from(text.value.as_str()),
+                raw: Atom::from(encode_jsx_text(&text.value)),
+            }),
         }
     }
 
-    fn convert_jsx_fragment(
-        &self,
-        frag: &react_compiler_ast::jsx::JSXFragment,
-    ) -> swc_ecma_ast::JSXFragment {
-        let children = frag
-            .children
-            .iter()
-            .map(|c| self.convert_jsx_child(c))
-            .collect();
-        swc_ecma_ast::JSXFragment {
-            span: self.span(&frag.base),
-            opening: swc_ecma_ast::JSXOpeningFragment {
-                span: self.span(&frag.opening_fragment.base),
+    fn convert_jsx_fragment(&self, frag: &JSXFragment) -> swc::JSXFragment {
+        swc::JSXFragment {
+            span: self.span_from_base(&frag.base),
+            opening: swc::JSXOpeningFragment {
+                span: self.span_from_base(&frag.opening_fragment.base),
             },
-            children,
-            closing: swc_ecma_ast::JSXClosingFragment {
-                span: self.span(&frag.closing_fragment.base),
+            children: frag
+                .children
+                .iter()
+                .map(|child| self.convert_jsx_child(child))
+                .collect(),
+            closing: swc::JSXClosingFragment {
+                span: self.span_from_base(&frag.closing_fragment.base),
             },
         }
     }
 
-    // ===== Import/Export =====
+    fn convert_import_declaration(&self, decl: &ImportDeclaration) -> swc::ImportDecl {
+        let mut import = swc::ImportDecl {
+            span: self.span_from_base(&decl.base),
+            specifiers: decl
+                .specifiers
+                .iter()
+                .map(|specifier| self.convert_import_specifier(specifier))
+                .collect(),
+            src: Box::new(self.convert_string_literal(&decl.source)),
+            type_only: matches!(
+                decl.import_kind,
+                Some(ImportKind::Type | ImportKind::Typeof)
+            ),
+            with: self
+                .convert_with_clause(decl.attributes.as_deref().or(decl.assertions.as_deref())),
+            phase: swc::ImportPhase::Evaluation,
+        };
+        self.preserved_ast.borrow_mut().load_import(&mut import);
+        import
+    }
 
-    fn convert_import_declaration(&self, decl: &ImportDeclaration) -> swc_ecma_ast::ImportDecl {
-        let specifiers = decl
-            .specifiers
-            .iter()
-            .map(|s| self.convert_import_specifier(s))
-            .collect();
-        let src = Box::new(Str {
-            span: self.span(&decl.source.base),
-            value: self.wtf8(&decl.source.value),
-            raw: None,
-        });
-        let type_only = matches!(decl.import_kind.as_ref(), Some(ImportKind::Type));
-        swc_ecma_ast::ImportDecl {
-            span: self.span(&decl.base),
-            specifiers,
-            src,
-            type_only,
-            with: None,
-            phase: Default::default(),
+    fn convert_with_clause(
+        &self,
+        attributes: Option<&[ImportAttribute]>,
+    ) -> Option<Box<swc::ObjectLit>> {
+        let attributes = attributes?;
+        Some(Box::new(swc::ObjectLit {
+            span: attributes
+                .first()
+                .map_or(DUMMY_SP, |attr| self.span_from_base(&attr.base)),
+            props: attributes
+                .iter()
+                .map(|attr| {
+                    swc::PropOrSpread::Prop(Box::new(swc::Prop::KeyValue(
+                        self.convert_import_attribute(attr),
+                    )))
+                })
+                .collect(),
+        }))
+    }
+
+    fn convert_import_attribute(&self, attr: &ImportAttribute) -> swc::KeyValueProp {
+        swc::KeyValueProp {
+            key: swc::PropName::Ident(self.make_ident_name(&attr.key.base, &attr.key.name)),
+            value: Box::new(swc::Expr::Lit(swc::Lit::Str(
+                self.convert_string_literal(&attr.value),
+            ))),
         }
     }
 
-    fn convert_import_specifier(
-        &self,
-        spec: &react_compiler_ast::declarations::ImportSpecifier,
-    ) -> swc_ecma_ast::ImportSpecifier {
-        match spec {
-            react_compiler_ast::declarations::ImportSpecifier::ImportSpecifier(s) => {
-                let local = self.ident(&s.local.name, self.span(&s.local.base));
+    fn convert_import_specifier(&self, specifier: &ImportSpecifier) -> swc::ImportSpecifier {
+        match specifier {
+            ImportSpecifier::ImportSpecifier(specifier) => {
                 // Only set `imported` if it differs from `local` — otherwise
                 // SWC emits `foo as foo` instead of just `foo`.
-                let imported_name = match &s.imported {
+                let imported_name = match &specifier.imported {
                     react_compiler_ast::declarations::ModuleExportName::Identifier(id) => {
                         Some(&id.name)
                     }
                     react_compiler_ast::declarations::ModuleExportName::StringLiteral(_) => None,
                 };
-                let imported = if imported_name == Some(&s.local.name) {
-                    None
-                } else {
-                    Some(self.convert_module_export_name(&s.imported))
-                };
-                let is_type_only = matches!(s.import_kind.as_ref(), Some(ImportKind::Type));
-                swc_ecma_ast::ImportSpecifier::Named(ImportNamedSpecifier {
-                    span: self.span(&s.base),
-                    local,
+                let imported = (imported_name != Some(&specifier.local.name))
+                    .then(|| self.convert_module_export_name(&specifier.imported));
+                swc::ImportSpecifier::Named(swc::ImportNamedSpecifier {
+                    span: self.span_from_base(&specifier.base),
+                    local: self.convert_identifier(&specifier.local),
                     imported,
-                    is_type_only,
+                    is_type_only: matches!(
+                        specifier.import_kind,
+                        Some(ImportKind::Type | ImportKind::Typeof)
+                    ),
                 })
             }
-            react_compiler_ast::declarations::ImportSpecifier::ImportDefaultSpecifier(s) => {
-                let local = self.ident(&s.local.name, self.span(&s.local.base));
-                swc_ecma_ast::ImportSpecifier::Default(ImportDefaultSpecifier {
-                    span: self.span(&s.base),
-                    local,
+            ImportSpecifier::ImportDefaultSpecifier(specifier) => {
+                swc::ImportSpecifier::Default(swc::ImportDefaultSpecifier {
+                    span: self.span_from_base(&specifier.base),
+                    local: self.convert_identifier(&specifier.local),
                 })
             }
-            react_compiler_ast::declarations::ImportSpecifier::ImportNamespaceSpecifier(s) => {
-                let local = self.ident(&s.local.name, self.span(&s.local.base));
-                swc_ecma_ast::ImportSpecifier::Namespace(ImportStarAsSpecifier {
-                    span: self.span(&s.base),
-                    local,
+            ImportSpecifier::ImportNamespaceSpecifier(specifier) => {
+                swc::ImportSpecifier::Namespace(swc::ImportStarAsSpecifier {
+                    span: self.span_from_base(&specifier.base),
+                    local: self.convert_identifier(&specifier.local),
                 })
             }
         }
     }
 
-    fn convert_module_export_name(
-        &self,
-        name: &react_compiler_ast::declarations::ModuleExportName,
-    ) -> swc_ecma_ast::ModuleExportName {
+    fn convert_module_export_name(&self, name: &ModuleExportName) -> swc::ModuleExportName {
         match name {
-            react_compiler_ast::declarations::ModuleExportName::Identifier(id) => {
-                swc_ecma_ast::ModuleExportName::Ident(self.ident(&id.name, self.span(&id.base)))
+            ModuleExportName::Identifier(id) => {
+                swc::ModuleExportName::Ident(self.convert_identifier(id))
             }
-            react_compiler_ast::declarations::ModuleExportName::StringLiteral(s) => {
-                swc_ecma_ast::ModuleExportName::Str(Str {
-                    span: self.span(&s.base),
-                    value: self.wtf8(&s.value),
-                    raw: None,
-                })
+            ModuleExportName::StringLiteral(lit) => {
+                swc::ModuleExportName::Str(self.convert_string_literal(lit))
             }
         }
     }
 
-    fn convert_export_named_to_module_item(&self, decl: &ExportNamedDeclaration) -> ModuleItem {
-        // If there's a declaration, emit as ExportDecl
-        if let Some(declaration) = &decl.declaration {
-            let swc_decl = self.convert_declaration(declaration);
-            return ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {
-                span: self.span(&decl.base),
-                decl: swc_decl,
-            }));
+    fn convert_export_named_declaration(&self, decl: &ExportNamedDeclaration) -> swc::ModuleDecl {
+        if let Some(declaration) = decl.declaration.as_ref() {
+            return swc::ModuleDecl::ExportDecl(swc::ExportDecl {
+                span: self.span_from_base(&decl.base),
+                decl: self.convert_declaration(declaration),
+            });
         }
-        self.convert_export_named_specifiers(decl)
+        swc::ModuleDecl::ExportNamed(swc::NamedExport {
+            span: self.span_from_base(&decl.base),
+            specifiers: decl
+                .specifiers
+                .iter()
+                .map(|specifier| self.convert_export_specifier(specifier))
+                .collect(),
+            src: decl
+                .source
+                .as_ref()
+                .map(|source| Box::new(self.convert_string_literal(source))),
+            type_only: matches!(decl.export_kind, Some(ExportKind::Type)),
+            with: self
+                .convert_with_clause(decl.attributes.as_deref().or(decl.assertions.as_deref())),
+        })
     }
 
-    fn convert_declaration(&self, decl: &react_compiler_ast::declarations::Declaration) -> Decl {
+    fn convert_declaration(&self, decl: &Declaration) -> swc::Decl {
         match decl {
-            react_compiler_ast::declarations::Declaration::FunctionDeclaration(f) => {
-                Decl::Fn(self.convert_function_declaration(f))
+            Declaration::FunctionDeclaration(func) => {
+                swc::Decl::Fn(self.convert_function_declaration(func))
             }
-            react_compiler_ast::declarations::Declaration::VariableDeclaration(v) => {
-                Decl::Var(Box::new(self.convert_variable_declaration(v)))
+            Declaration::ClassDeclaration(class) => swc::Decl::Class(swc::ClassDecl {
+                ident: class.id.as_ref().map_or_else(
+                    || self.private_ident("__default_class", &class.base),
+                    |id| self.convert_identifier(id),
+                ),
+                declare: class.declare.unwrap_or(false),
+                class: Box::new(self.convert_class_declaration(class)),
+            }),
+            Declaration::VariableDeclaration(decl) => self.convert_variable_declaration(decl),
+            Declaration::TSTypeAliasDeclaration(decl) => {
+                if let swc::ModuleItem::Stmt(swc::Stmt::Decl(decl)) =
+                    self.convert_ts_type_alias_declaration(decl)
+                {
+                    decl
+                } else {
+                    self.invalid_var_decl(&decl.base)
+                }
             }
-            react_compiler_ast::declarations::Declaration::ClassDeclaration(c) => {
-                let ident =
-                    c.id.as_ref()
-                        .map(|id| self.ident(&id.name, self.span(&id.base)))
-                        .unwrap_or_else(|| self.ident("_anonymous", DUMMY_SP));
-                let super_class = c
-                    .super_class
-                    .as_ref()
-                    .map(|s| Box::new(self.convert_expression(s)));
-                Decl::Class(ClassDecl {
-                    ident,
-                    declare: c.declare.unwrap_or(false),
-                    class: Box::new(Class {
-                        span: self.span(&c.base),
-                        ctxt: SyntaxContext::empty(),
-                        decorators: vec![],
-                        body: vec![],
-                        super_class,
-                        is_abstract: false,
-                        type_params: None,
-                        super_type_params: None,
-                        implements: vec![],
-                    }),
-                })
+            Declaration::TSInterfaceDeclaration(decl) => {
+                if let swc::ModuleItem::Stmt(swc::Stmt::Decl(decl)) =
+                    self.convert_ts_interface_declaration(decl)
+                {
+                    decl
+                } else {
+                    self.invalid_var_decl(&decl.base)
+                }
             }
-            _ => Decl::Var(Box::new(VarDecl {
-                span: DUMMY_SP,
-                ctxt: SyntaxContext::empty(),
-                kind: VarDeclKind::Const,
-                declare: true,
-                decls: vec![],
-            })),
+            Declaration::TSEnumDeclaration(decl) => {
+                if let swc::ModuleItem::Stmt(swc::Stmt::Decl(decl)) =
+                    self.convert_ts_enum_declaration(decl)
+                {
+                    decl
+                } else {
+                    self.invalid_var_decl(&decl.base)
+                }
+            }
+            Declaration::TSModuleDeclaration(decl) => {
+                if let swc::ModuleItem::Stmt(swc::Stmt::Decl(decl)) =
+                    self.convert_ts_module_declaration(decl)
+                {
+                    decl
+                } else {
+                    self.invalid_var_decl(&decl.base)
+                }
+            }
+            Declaration::TSDeclareFunction(decl) => {
+                if let swc::ModuleItem::Stmt(swc::Stmt::Decl(decl)) =
+                    self.convert_ts_declare_function(decl)
+                {
+                    decl
+                } else {
+                    self.invalid_var_decl(&decl.base)
+                }
+            }
+            Declaration::TypeAlias(_)
+            | Declaration::OpaqueType(_)
+            | Declaration::InterfaceDeclaration(_)
+            | Declaration::EnumDeclaration(_) => {
+                unreachable!("SWC forward conversion does not produce Flow declarations")
+            }
         }
     }
 
-    fn convert_export_named_specifiers(&self, decl: &ExportNamedDeclaration) -> ModuleItem {
-        let specifiers = decl
-            .specifiers
-            .iter()
-            .map(|s| self.convert_export_specifier(s))
-            .collect();
-        let src = decl.source.as_ref().map(|s| {
-            Box::new(Str {
-                span: self.span(&s.base),
-                value: self.wtf8(&s.value),
-                raw: None,
-            })
-        });
-        let type_only = matches!(decl.export_kind.as_ref(), Some(ExportKind::Type));
-
-        ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(NamedExport {
-            span: self.span(&decl.base),
-            specifiers,
-            src,
-            type_only,
-            with: None,
-        }))
-    }
-
-    fn convert_export_specifier(
-        &self,
-        spec: &react_compiler_ast::declarations::ExportSpecifier,
-    ) -> swc_ecma_ast::ExportSpecifier {
-        match spec {
-            react_compiler_ast::declarations::ExportSpecifier::ExportSpecifier(s) => {
-                let orig = self.convert_module_export_name(&s.local);
-                // Only set `exported` if it differs from `local`
-                let local_name = match &s.local {
-                    react_compiler_ast::declarations::ModuleExportName::Identifier(id) => {
-                        Some(&id.name)
-                    }
-                    _ => None,
+    fn convert_export_specifier(&self, specifier: &ExportSpecifier) -> swc::ExportSpecifier {
+        match specifier {
+            ExportSpecifier::ExportSpecifier(specifier) => {
+                let exported = match (&specifier.local, &specifier.exported) {
+                    (
+                        ModuleExportName::Identifier(local),
+                        ModuleExportName::Identifier(exported),
+                    ) if local.name == exported.name => None,
+                    (_, exported) => Some(self.convert_module_export_name(exported)),
                 };
-                let exported_name = match &s.exported {
-                    react_compiler_ast::declarations::ModuleExportName::Identifier(id) => {
-                        Some(&id.name)
-                    }
-                    _ => None,
-                };
-                let exported = if local_name.is_some() && local_name == exported_name {
-                    None
-                } else {
-                    Some(self.convert_module_export_name(&s.exported))
-                };
-                let is_type_only = matches!(s.export_kind.as_ref(), Some(ExportKind::Type));
-                swc_ecma_ast::ExportSpecifier::Named(ExportNamedSpecifier {
-                    span: self.span(&s.base),
-                    orig,
+                swc::ExportSpecifier::Named(swc::ExportNamedSpecifier {
+                    span: self.span_from_base(&specifier.base),
+                    orig: self.convert_module_export_name(&specifier.local),
                     exported,
-                    is_type_only,
+                    is_type_only: matches!(specifier.export_kind, Some(ExportKind::Type)),
                 })
             }
-            react_compiler_ast::declarations::ExportSpecifier::ExportDefaultSpecifier(s) => {
-                swc_ecma_ast::ExportSpecifier::Default(swc_ecma_ast::ExportDefaultSpecifier {
-                    exported: self.ident(&s.exported.name, self.span(&s.exported.base)),
+            ExportSpecifier::ExportDefaultSpecifier(specifier) => {
+                swc::ExportSpecifier::Default(swc::ExportDefaultSpecifier {
+                    exported: self.convert_identifier(&specifier.exported),
                 })
             }
-            react_compiler_ast::declarations::ExportSpecifier::ExportNamespaceSpecifier(s) => {
-                let name = self.convert_module_export_name(&s.exported);
-                swc_ecma_ast::ExportSpecifier::Namespace(ExportNamespaceSpecifier {
-                    span: self.span(&s.base),
-                    name,
+            ExportSpecifier::ExportNamespaceSpecifier(specifier) => {
+                swc::ExportSpecifier::Namespace(swc::ExportNamespaceSpecifier {
+                    span: self.span_from_base(&specifier.base),
+                    name: self.convert_module_export_name(&specifier.exported),
                 })
             }
         }
     }
 
-    fn convert_export_default_to_module_item(&self, decl: &ExportDefaultDeclaration) -> ModuleItem {
-        let span = self.span(&decl.base);
-        match &*decl.declaration {
-            BabelExportDefaultDecl::FunctionDeclaration(f) => {
-                let fd = self.convert_function_declaration(f);
-                ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(
-                    swc_ecma_ast::ExportDefaultDecl {
-                        span,
-                        decl: swc_ecma_ast::DefaultDecl::Fn(FnExpr {
-                            ident: Some(fd.ident),
-                            function: fd.function,
-                        }),
-                    },
-                ))
-            }
-            BabelExportDefaultDecl::ClassDeclaration(c) => {
-                let ident =
-                    c.id.as_ref()
-                        .map(|id| self.ident(&id.name, self.span(&id.base)));
-                let super_class = c
-                    .super_class
-                    .as_ref()
-                    .map(|s| Box::new(self.convert_expression(s)));
-                ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(
-                    swc_ecma_ast::ExportDefaultDecl {
-                        span,
-                        decl: swc_ecma_ast::DefaultDecl::Class(ClassExpr {
-                            ident,
-                            class: Box::new(Class {
-                                span,
-                                ctxt: SyntaxContext::empty(),
-                                decorators: vec![],
-                                body: vec![],
-                                super_class,
-                                is_abstract: false,
-                                type_params: None,
-                                super_type_params: None,
-                                implements: vec![],
-                            }),
-                        }),
-                    },
-                ))
-            }
-            BabelExportDefaultDecl::EnumDeclaration(_) => {
-                // Flow enum declarations cannot be represented in SWC AST;
-                // emit a null placeholder to preserve the export shape.
-                ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(ExportDefaultExpr {
-                    span,
-                    expr: Box::new(swc_ecma_ast::Expr::Lit(swc_ecma_ast::Lit::Null(
-                        swc_ecma_ast::Null { span },
-                    ))),
-                }))
-            }
-            BabelExportDefaultDecl::Expression(e) => {
-                ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(ExportDefaultExpr {
-                    span,
-                    expr: Box::new(self.convert_expression(e)),
-                }))
-            }
-        }
-    }
-
-    fn convert_export_all_declaration(
+    fn convert_export_default_declaration(
         &self,
-        decl: &ExportAllDeclaration,
-    ) -> swc_ecma_ast::ExportAll {
-        let src = Box::new(Str {
-            span: self.span(&decl.source.base),
-            value: self.wtf8(&decl.source.value),
+        decl: &ExportDefaultDeclaration,
+    ) -> swc::ModuleDecl {
+        let mut preserved_decl = swc::ExportDefaultDecl {
+            span: self.span_from_base(&decl.base),
+            decl: swc::DefaultDecl::TsInterfaceDecl(Box::new(swc::TsInterfaceDecl {
+                span: self.span_from_base(&decl.base),
+                id: self.private_ident("__default_interface", &decl.base),
+                declare: false,
+                type_params: None,
+                extends: vec![],
+                body: swc::TsInterfaceBody {
+                    span: self.span_from_base(&decl.base),
+                    body: vec![],
+                },
+            })),
+        };
+        if self
+            .preserved_ast
+            .borrow_mut()
+            .load_export_default_ts_interface(&mut preserved_decl)
+        {
+            return swc::ModuleDecl::ExportDefaultDecl(preserved_decl);
+        }
+
+        match self.convert_export_default_decl(&decl.declaration) {
+            Ok(default_decl) => swc::ModuleDecl::ExportDefaultDecl(swc::ExportDefaultDecl {
+                span: self.span_from_base(&decl.base),
+                decl: default_decl,
+            }),
+            Err(expr) => swc::ModuleDecl::ExportDefaultExpr(swc::ExportDefaultExpr {
+                span: self.span_from_base(&decl.base),
+                expr: Box::new(expr),
+            }),
+        }
+    }
+
+    fn convert_export_default_decl(
+        &self,
+        decl: &ExportDefaultDecl,
+    ) -> Result<swc::DefaultDecl, swc::Expr> {
+        match decl {
+            ExportDefaultDecl::FunctionDeclaration(func) => Ok(swc::DefaultDecl::Fn(swc::FnExpr {
+                ident: func.id.as_ref().map(|id| self.convert_identifier(id)),
+                function: self.convert_function_declaration(func).function,
+            })),
+            ExportDefaultDecl::ClassDeclaration(class) => {
+                Ok(swc::DefaultDecl::Class(swc::ClassExpr {
+                    ident: class.id.as_ref().map(|id| self.convert_identifier(id)),
+                    class: Box::new(self.convert_class_declaration(class)),
+                }))
+            }
+            ExportDefaultDecl::Expression(expr) => Err(self.convert_expression(expr)),
+            ExportDefaultDecl::EnumDeclaration(enum_decl) => Err(swc::Expr::Ident(
+                self.private_ident(&enum_decl.id.name, &enum_decl.base),
+            )),
+        }
+    }
+
+    fn convert_export_all_declaration(&self, decl: &ExportAllDeclaration) -> swc::ExportAll {
+        swc::ExportAll {
+            span: self.span_from_base(&decl.base),
+            src: Box::new(self.convert_string_literal(&decl.source)),
+            type_only: matches!(decl.export_kind, Some(ExportKind::Type)),
+            with: self
+                .convert_with_clause(decl.attributes.as_deref().or(decl.assertions.as_deref())),
+        }
+    }
+
+    fn convert_binary_operator(&self, op: &BinaryOperator) -> swc::BinaryOp {
+        match op {
+            BinaryOperator::Add => swc::BinaryOp::Add,
+            BinaryOperator::Sub => swc::BinaryOp::Sub,
+            BinaryOperator::Mul => swc::BinaryOp::Mul,
+            BinaryOperator::Div => swc::BinaryOp::Div,
+            BinaryOperator::Rem => swc::BinaryOp::Mod,
+            BinaryOperator::Exp => swc::BinaryOp::Exp,
+            BinaryOperator::Eq => swc::BinaryOp::EqEq,
+            BinaryOperator::StrictEq => swc::BinaryOp::EqEqEq,
+            BinaryOperator::Neq => swc::BinaryOp::NotEq,
+            BinaryOperator::StrictNeq => swc::BinaryOp::NotEqEq,
+            BinaryOperator::Lt => swc::BinaryOp::Lt,
+            BinaryOperator::Lte => swc::BinaryOp::LtEq,
+            BinaryOperator::Gt => swc::BinaryOp::Gt,
+            BinaryOperator::Gte => swc::BinaryOp::GtEq,
+            BinaryOperator::Shl => swc::BinaryOp::LShift,
+            BinaryOperator::Shr => swc::BinaryOp::RShift,
+            BinaryOperator::UShr => swc::BinaryOp::ZeroFillRShift,
+            BinaryOperator::BitOr => swc::BinaryOp::BitOr,
+            BinaryOperator::BitXor => swc::BinaryOp::BitXor,
+            BinaryOperator::BitAnd => swc::BinaryOp::BitAnd,
+            BinaryOperator::In => swc::BinaryOp::In,
+            BinaryOperator::Instanceof => swc::BinaryOp::InstanceOf,
+            BinaryOperator::Pipeline => swc::BinaryOp::Add,
+        }
+    }
+
+    fn convert_logical_operator(&self, op: &LogicalOperator) -> swc::BinaryOp {
+        match op {
+            LogicalOperator::Or => swc::BinaryOp::LogicalOr,
+            LogicalOperator::And => swc::BinaryOp::LogicalAnd,
+            LogicalOperator::NullishCoalescing => swc::BinaryOp::NullishCoalescing,
+        }
+    }
+
+    fn convert_unary_operator(&self, op: &UnaryOperator) -> swc::UnaryOp {
+        match op {
+            UnaryOperator::Neg => swc::UnaryOp::Minus,
+            UnaryOperator::Plus => swc::UnaryOp::Plus,
+            UnaryOperator::Not => swc::UnaryOp::Bang,
+            UnaryOperator::BitNot => swc::UnaryOp::Tilde,
+            UnaryOperator::TypeOf => swc::UnaryOp::TypeOf,
+            UnaryOperator::Void => swc::UnaryOp::Void,
+            UnaryOperator::Delete => swc::UnaryOp::Delete,
+            UnaryOperator::Throw => swc::UnaryOp::Void,
+        }
+    }
+
+    fn convert_update_operator(&self, op: &UpdateOperator) -> swc::UpdateOp {
+        match op {
+            UpdateOperator::Increment => swc::UpdateOp::PlusPlus,
+            UpdateOperator::Decrement => swc::UpdateOp::MinusMinus,
+        }
+    }
+
+    fn convert_assignment_operator(&self, op: &AssignmentOperator) -> swc::AssignOp {
+        match op {
+            AssignmentOperator::Assign => swc::AssignOp::Assign,
+            AssignmentOperator::AddAssign => swc::AssignOp::AddAssign,
+            AssignmentOperator::SubAssign => swc::AssignOp::SubAssign,
+            AssignmentOperator::MulAssign => swc::AssignOp::MulAssign,
+            AssignmentOperator::DivAssign => swc::AssignOp::DivAssign,
+            AssignmentOperator::RemAssign => swc::AssignOp::ModAssign,
+            AssignmentOperator::ExpAssign => swc::AssignOp::ExpAssign,
+            AssignmentOperator::ShlAssign => swc::AssignOp::LShiftAssign,
+            AssignmentOperator::ShrAssign => swc::AssignOp::RShiftAssign,
+            AssignmentOperator::UShrAssign => swc::AssignOp::ZeroFillRShiftAssign,
+            AssignmentOperator::BitOrAssign => swc::AssignOp::BitOrAssign,
+            AssignmentOperator::BitXorAssign => swc::AssignOp::BitXorAssign,
+            AssignmentOperator::BitAndAssign => swc::AssignOp::BitAndAssign,
+            AssignmentOperator::OrAssign => swc::AssignOp::OrAssign,
+            AssignmentOperator::AndAssign => swc::AssignOp::AndAssign,
+            AssignmentOperator::NullishAssign => swc::AssignOp::NullishAssign,
+        }
+    }
+
+    fn convert_identifier(&self, id: &Identifier) -> swc::Ident {
+        swc::Ident {
+            span: self.span_from_base(&id.base),
+            ctxt: SyntaxContext::empty(),
+            sym: self.atom(&id.name),
+            optional: id.optional.unwrap_or(false),
+        }
+    }
+
+    fn convert_jsx_identifier(&self, id: &JSXIdentifier) -> swc::Ident {
+        swc::Ident {
+            span: self.span_from_base(&id.base),
+            ctxt: SyntaxContext::empty(),
+            sym: self.atom(&id.name),
+            optional: false,
+        }
+    }
+
+    fn make_ident_name(&self, base: &BaseNode, name: &str) -> swc::IdentName {
+        swc::IdentName::new(self.atom(name), self.span_from_base(base))
+    }
+
+    fn convert_string_literal(&self, lit: &StringLiteral) -> swc::Str {
+        swc::Str {
+            span: self.span_from_base(&lit.base),
+            value: lit.value.as_str().into(),
             raw: None,
-        });
-        let type_only = matches!(decl.export_kind.as_ref(), Some(ExportKind::Type));
-        swc_ecma_ast::ExportAll {
-            span: self.span(&decl.base),
-            src,
-            type_only,
-            with: None,
         }
     }
 
-    // ===== TS type helpers =====
-
-    /// Convert a Babel TSTypeAnnotation JSON to an SWC TsTypeAnnotation.
-    /// Returns None if the JSON is not a valid type annotation.
-    fn convert_ts_type_annotation_from_json(
-        &self,
-        json: &serde_json::Value,
-    ) -> Option<Box<TsTypeAnn>> {
-        let type_name = json.get("type")?.as_str()?;
-        if type_name != "TSTypeAnnotation" && type_name != "TypeAnnotation" {
-            return None;
+    fn private_ident(&self, name: &str, base: &BaseNode) -> swc::Ident {
+        swc::Ident {
+            span: self.span_from_base(base),
+            ctxt: SyntaxContext::empty(),
+            sym: self.atom(name),
+            optional: false,
         }
-        let type_annotation = json.get("typeAnnotation")?;
-        let ts_type = self.convert_ts_type_from_json(type_annotation, DUMMY_SP);
-        Some(Box::new(TsTypeAnn {
-            span: DUMMY_SP,
-            type_ann: Box::new(ts_type),
+    }
+
+    fn expression_span(&self, expr: &Expression) -> Span {
+        Self::expression_base(expr).map_or(DUMMY_SP, |base| self.span_from_base(base))
+    }
+
+    fn pattern_span(&self, pattern: &PatternLike) -> Span {
+        match pattern {
+            PatternLike::Identifier(id) => self.span_from_base(&id.base),
+            PatternLike::ObjectPattern(pattern) => self.span_from_base(&pattern.base),
+            PatternLike::ArrayPattern(pattern) => self.span_from_base(&pattern.base),
+            PatternLike::AssignmentPattern(pattern) => self.span_from_base(&pattern.base),
+            PatternLike::RestElement(pattern) => self.span_from_base(&pattern.base),
+            PatternLike::MemberExpression(pattern) => self.span_from_base(&pattern.base),
+            PatternLike::TSAsExpression(pattern) => self.span_from_base(&pattern.base),
+            PatternLike::TSSatisfiesExpression(pattern) => self.span_from_base(&pattern.base),
+            PatternLike::TSNonNullExpression(pattern) => self.span_from_base(&pattern.base),
+            PatternLike::TSTypeAssertion(pattern) => self.span_from_base(&pattern.base),
+            PatternLike::TypeCastExpression(pattern) => self.span_from_base(&pattern.base),
+        }
+    }
+
+    fn convert_class_body(&self, _body: &ClassBody) -> Vec<swc::ClassMember> {
+        // Class member JSON is a passthrough in the forward converter. Full
+        // member fidelity comes from `PreservedAst::load_class`.
+        vec![]
+    }
+
+    fn convert_ts_type_alias_declaration(&self, decl: &TSTypeAliasDeclaration) -> swc::ModuleItem {
+        let mut ts_decl = swc::TsTypeAliasDecl {
+            span: self.span_from_base(&decl.base),
+            declare: decl.declare.unwrap_or(false),
+            id: self.convert_identifier(&decl.id),
+            type_params: None,
+            type_ann: self.any_ts_type(self.span_from_base(&decl.base)),
+        };
+        if !self
+            .preserved_ast
+            .borrow_mut()
+            .load_ts_type_alias(&mut ts_decl)
+        {
+            self.cold_fill_ts_type_alias_from_json(
+                &mut ts_decl,
+                &decl.type_annotation,
+                self.span_from_base(&decl.base),
+            );
+        }
+        swc::Stmt::Decl(swc::Decl::TsTypeAlias(Box::new(ts_decl))).into()
+    }
+
+    fn convert_ts_interface_declaration(&self, decl: &TSInterfaceDeclaration) -> swc::ModuleItem {
+        let mut ts_decl = swc::TsInterfaceDecl {
+            span: self.span_from_base(&decl.base),
+            id: self.convert_identifier(&decl.id),
+            declare: decl.declare.unwrap_or(false),
+            type_params: None,
+            extends: vec![],
+            body: swc::TsInterfaceBody {
+                span: DUMMY_SP,
+                body: vec![],
+            },
+        };
+        if !self
+            .preserved_ast
+            .borrow_mut()
+            .load_ts_interface(&mut ts_decl)
+        {
+            ts_decl.body.span = self.span_from_json_value(&decl.body);
+        }
+        swc::Stmt::Decl(swc::Decl::TsInterface(Box::new(ts_decl))).into()
+    }
+
+    fn convert_ts_enum_declaration(&self, decl: &TSEnumDeclaration) -> swc::ModuleItem {
+        let mut ts_decl = swc::TsEnumDecl {
+            span: self.span_from_base(&decl.base),
+            declare: decl.declare.unwrap_or(false),
+            is_const: decl.is_const.unwrap_or(false),
+            id: self.convert_identifier(&decl.id),
+            members: vec![],
+        };
+        self.preserved_ast.borrow_mut().load_ts_enum(&mut ts_decl);
+        swc::Stmt::Decl(swc::Decl::TsEnum(Box::new(ts_decl))).into()
+    }
+
+    fn convert_ts_module_declaration(&self, decl: &TSModuleDeclaration) -> swc::ModuleItem {
+        let id = self.convert_ts_module_id_from_json(decl);
+        let placeholder_id = id.clone().unwrap_or_else(|| {
+            swc::TsModuleName::Ident(self.private_ident("__namespace", &decl.base))
+        });
+
+        let mut item: swc::ModuleItem =
+            swc::Stmt::Decl(swc::Decl::TsModule(Box::new(swc::TsModuleDecl {
+                span: self.span_from_base(&decl.base),
+                declare: decl.declare.unwrap_or(false),
+                global: decl.global.unwrap_or(false),
+                namespace: false,
+                id: placeholder_id,
+                body: None,
+            })))
+            .into();
+        self.preserved_ast
+            .borrow_mut()
+            .load_module_item(&mut item, id);
+        item
+    }
+
+    #[cold]
+    fn convert_ts_module_id_from_json(
+        &self,
+        decl: &TSModuleDeclaration,
+    ) -> Option<swc::TsModuleName> {
+        self.convert_ts_module_name_from_json(&decl.id)
+    }
+
+    #[cold]
+    fn convert_ts_module_name_from_json(
+        &self,
+        value: &serde_json::Value,
+    ) -> Option<swc::TsModuleName> {
+        match json_type(value) {
+            Some("Identifier") => self
+                .convert_ident_from_json(value)
+                .map(swc::TsModuleName::Ident),
+            Some("StringLiteral") => self
+                .convert_str_from_json(value)
+                .map(swc::TsModuleName::Str),
+            Some(_) => None,
+            None if value.get("name").is_some() => self
+                .convert_ident_from_json(value)
+                .map(swc::TsModuleName::Ident),
+            None if value.get("value").is_some() => self
+                .convert_str_from_json(value)
+                .map(swc::TsModuleName::Str),
+            None => None,
+        }
+    }
+
+    #[cold]
+    fn convert_ident_from_json(&self, value: &serde_json::Value) -> Option<swc::Ident> {
+        Some(swc::Ident {
+            span: self.span_from_json_value(value),
+            ctxt: SyntaxContext::empty(),
+            sym: self.atom(json_str(value, "name")?),
+            optional: json_bool(value, "optional").unwrap_or(false),
+        })
+    }
+
+    #[cold]
+    fn convert_str_from_json(&self, value: &serde_json::Value) -> Option<swc::Str> {
+        Some(swc::Str {
+            span: self.span_from_json_value(value),
+            value: json_str(value, "value")?.into(),
+            raw: None,
+        })
+    }
+
+    fn convert_ts_declare_function(&self, decl: &TSDeclareFunction) -> swc::ModuleItem {
+        let id = decl.id.as_ref().map_or_else(
+            || self.private_ident("__declare", &decl.base),
+            |id| self.convert_identifier(id),
+        );
+        let params: Vec<_> = decl
+            .params
+            .iter()
+            .filter_map(|param| serde_json::from_value::<PatternLike>(param.clone()).ok())
+            .collect();
+        let mut function = swc::Function {
+            params: params
+                .iter()
+                .map(|param| self.convert_pattern_like_as_formal_parameter_omitting_types(param))
+                .collect(),
+            decorators: vec![],
+            span: self.span_from_base(&decl.base),
+            ctxt: SyntaxContext::empty(),
+            body: None,
+            is_generator: decl.generator.unwrap_or(false),
+            is_async: decl.is_async.unwrap_or(false),
+            type_params: None,
+            return_type: None,
+        };
+        if !self.preserved_ast.borrow_mut().load_function(&mut function)
+            && (Self::patterns_have_type_annotations(&params)
+                || Self::has_type_annotation(decl.return_type.as_deref()))
+        {
+            self.cold_fill_function_types_from_json(
+                &mut function,
+                &params,
+                decl.return_type.as_deref(),
+            );
+        }
+
+        swc::Stmt::Decl(swc::Decl::Fn(swc::FnDecl {
+            ident: id,
+            declare: decl.declare.unwrap_or(true),
+            function: Box::new(function),
+        }))
+        .into()
+    }
+
+    fn invalid_var_decl(&self, base: &BaseNode) -> swc::Decl {
+        swc::Decl::Var(Box::new(swc::VarDecl {
+            span: self.span_from_base(base),
+            ctxt: SyntaxContext::empty(),
+            kind: swc::VarDeclKind::Const,
+            declare: false,
+            decls: vec![swc::VarDeclarator {
+                span: self.span_from_base(base),
+                name: swc::Pat::Ident(swc::BindingIdent {
+                    id: self.private_ident("__unsupported_declaration", base),
+                    type_ann: None,
+                }),
+                init: None,
+                definite: false,
+            }],
         }))
     }
+}
 
-    /// Convert a JSON-serialized TypeScript type annotation to an SWC TsType.
-    /// This handles common cases from the compiler's output. For unrecognized
-    /// types, it falls back to `any`.
-    fn convert_ts_type_from_json(&self, json: &serde_json::Value, span: Span) -> TsType {
-        let type_name = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        match type_name {
-            "TSTypeReference" => {
-                let name = json
-                    .get("typeName")
-                    .and_then(|tn| tn.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("unknown");
-                if name == "const" {
-                    TsType::TsTypeRef(TsTypeRef {
-                        span,
-                        type_name: TsEntityName::Ident(self.ident("const", span)),
-                        type_params: None,
-                    })
-                } else {
-                    TsType::TsTypeRef(TsTypeRef {
-                        span,
-                        type_name: TsEntityName::Ident(self.ident(name, span)),
-                        type_params: None,
-                    })
-                }
-            }
-            "TSNumberKeyword" => TsType::TsKeywordType(TsKeywordType {
-                span,
-                kind: TsKeywordTypeKind::TsNumberKeyword,
-            }),
-            "TSStringKeyword" => TsType::TsKeywordType(TsKeywordType {
-                span,
-                kind: TsKeywordTypeKind::TsStringKeyword,
-            }),
-            "TSBooleanKeyword" => TsType::TsKeywordType(TsKeywordType {
-                span,
-                kind: TsKeywordTypeKind::TsBooleanKeyword,
-            }),
-            "TSVoidKeyword" => TsType::TsKeywordType(TsKeywordType {
-                span,
-                kind: TsKeywordTypeKind::TsVoidKeyword,
-            }),
-            "TSNullKeyword" => TsType::TsKeywordType(TsKeywordType {
-                span,
-                kind: TsKeywordTypeKind::TsNullKeyword,
-            }),
-            "TSUndefinedKeyword" => TsType::TsKeywordType(TsKeywordType {
-                span,
-                kind: TsKeywordTypeKind::TsUndefinedKeyword,
-            }),
-            "TSAnyKeyword" => TsType::TsKeywordType(TsKeywordType {
-                span,
-                kind: TsKeywordTypeKind::TsAnyKeyword,
-            }),
-            "TSNeverKeyword" => TsType::TsKeywordType(TsKeywordType {
-                span,
-                kind: TsKeywordTypeKind::TsNeverKeyword,
-            }),
-            "TSUnionType" => {
-                let types = json
-                    .get("types")
-                    .and_then(|t| t.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|t| Box::new(self.convert_ts_type_from_json(t, span)))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(
-                    TsUnionType { span, types },
-                ))
-            }
-            "TSIntersectionType" => {
-                let types = json
-                    .get("types")
-                    .and_then(|t| t.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|t| Box::new(self.convert_ts_type_from_json(t, span)))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsIntersectionType(
-                    TsIntersectionType { span, types },
-                ))
-            }
-            "TSLiteralType" => {
-                if let Some(literal) = json.get("literal") {
-                    let lit_type = literal.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match lit_type {
-                        "StringLiteral" => {
-                            let value = literal.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                            TsType::TsLitType(TsLitType {
-                                span,
-                                lit: TsLit::Str(Str {
-                                    span,
-                                    value: self.wtf8(value),
-                                    raw: None,
-                                }),
-                            })
-                        }
-                        "NumericLiteral" => {
-                            let value =
-                                literal.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            TsType::TsLitType(TsLitType {
-                                span,
-                                lit: TsLit::Number(Number {
-                                    span,
-                                    value,
-                                    raw: None,
-                                }),
-                            })
-                        }
-                        "BooleanLiteral" => {
-                            let value = literal
-                                .get("value")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            TsType::TsLitType(TsLitType {
-                                span,
-                                lit: TsLit::Bool(Bool { span, value }),
-                            })
-                        }
-                        _ => TsType::TsKeywordType(TsKeywordType {
-                            span,
-                            kind: TsKeywordTypeKind::TsAnyKeyword,
-                        }),
-                    }
-                } else {
-                    TsType::TsKeywordType(TsKeywordType {
-                        span,
-                        kind: TsKeywordTypeKind::TsAnyKeyword,
-                    })
-                }
-            }
-            "TSArrayType" => {
-                let elem = json
-                    .get("elementType")
-                    .map(|t| self.convert_ts_type_from_json(t, span))
-                    .unwrap_or(TsType::TsKeywordType(TsKeywordType {
-                        span,
-                        kind: TsKeywordTypeKind::TsAnyKeyword,
-                    }));
-                TsType::TsArrayType(TsArrayType {
-                    span,
-                    elem_type: Box::new(elem),
-                })
-            }
-            "TSFunctionType"
-            | "TSTypeLiteral"
-            | "TSParenthesizedType"
-            | "TSTupleType"
-            | "TSOptionalType"
-            | "TSRestType"
-            | "TSConditionalType"
-            | "TSInferType"
-            | "TSMappedType"
-            | "TSIndexedAccessType"
-            | "TSTypeOperator"
-            | "TSTypePredicate"
-            | "TSImportType"
-            | "TSQualifiedName" => {
-                // For complex types, try to extract from source text
-                if let (Some(source), Some(start), Some(end)) = (
-                    self.source_text.as_deref(),
-                    json.get("start").and_then(|v| v.as_u64()),
-                    json.get("end").and_then(|v| v.as_u64()),
-                ) {
-                    let start_idx = (start as usize).saturating_sub(1);
-                    let end_idx = (end as usize).saturating_sub(1);
-                    if start_idx < source.len() && end_idx <= source.len() && start_idx < end_idx {
-                        let text = &source[start_idx..end_idx];
-                        // Parse the type using SWC
-                        let wrapper = format!("type __T = {};", text);
-                        let cm = swc_common::sync::Lrc::new(swc_common::SourceMap::default());
-                        let fm = cm.new_source_file(
-                            swc_common::sync::Lrc::new(swc_common::FileName::Anon),
-                            wrapper,
-                        );
-                        let mut errors = vec![];
-                        if let Ok(module) = swc_ecma_parser::parse_file_as_module(
-                            &fm,
-                            swc_ecma_parser::Syntax::Typescript(swc_ecma_parser::TsSyntax {
-                                tsx: true,
-                                ..Default::default()
-                            }),
-                            swc_ecma_ast::EsVersion::latest(),
-                            None,
-                            &mut errors,
-                        ) {
-                            if let Some(ModuleItem::Stmt(Stmt::Decl(Decl::TsTypeAlias(alias)))) =
-                                module.body.into_iter().next()
-                            {
-                                return *alias.type_ann;
-                            }
-                        }
-                    }
-                }
-                // Fallback
-                TsType::TsKeywordType(TsKeywordType {
-                    span,
-                    kind: TsKeywordTypeKind::TsAnyKeyword,
-                })
-            }
-            // Flow types
-            "NumberTypeAnnotation"
-            | "StringTypeAnnotation"
-            | "BooleanTypeAnnotation"
-            | "VoidTypeAnnotation"
-            | "NullLiteralTypeAnnotation"
-            | "AnyTypeAnnotation"
-            | "GenericTypeAnnotation"
-            | "UnionTypeAnnotation"
-            | "IntersectionTypeAnnotation"
-            | "NullableTypeAnnotation"
-            | "FunctionTypeAnnotation"
-            | "ObjectTypeAnnotation"
-            | "ArrayTypeAnnotation"
-            | "TupleTypeAnnotation"
-            | "TypeofTypeAnnotation"
-            | "NumberLiteralTypeAnnotation"
-            | "StringLiteralTypeAnnotation"
-            | "BooleanLiteralTypeAnnotation" => {
-                // For Flow types, try to extract from source text
-                if let (Some(source), Some(start), Some(end)) = (
-                    self.source_text.as_deref(),
-                    json.get("start").and_then(|v| v.as_u64()),
-                    json.get("end").and_then(|v| v.as_u64()),
-                ) {
-                    let start_idx = (start as usize).saturating_sub(1);
-                    let end_idx = (end as usize).saturating_sub(1);
-                    if start_idx < source.len() && end_idx <= source.len() && start_idx < end_idx {
-                        let text = &source[start_idx..end_idx];
-                        // For Flow types, we can use TS parser as many simple types
-                        // have the same syntax
-                        let wrapper = format!("type __T = {};", text);
-                        let cm = swc_common::sync::Lrc::new(swc_common::SourceMap::default());
-                        let fm = cm.new_source_file(
-                            swc_common::sync::Lrc::new(swc_common::FileName::Anon),
-                            wrapper,
-                        );
-                        let mut errors = vec![];
-                        if let Ok(module) = swc_ecma_parser::parse_file_as_module(
-                            &fm,
-                            swc_ecma_parser::Syntax::Typescript(swc_ecma_parser::TsSyntax {
-                                tsx: true,
-                                ..Default::default()
-                            }),
-                            swc_ecma_ast::EsVersion::latest(),
-                            None,
-                            &mut errors,
-                        ) {
-                            if let Some(ModuleItem::Stmt(Stmt::Decl(Decl::TsTypeAlias(alias)))) =
-                                module.body.into_iter().next()
-                            {
-                                return *alias.type_ann;
-                            }
-                        }
-                    }
-                }
-                // Fallback
-                TsType::TsKeywordType(TsKeywordType {
-                    span,
-                    kind: TsKeywordTypeKind::TsAnyKeyword,
-                })
-            }
-            _ => {
-                // Fallback: emit `any` type
-                TsType::TsKeywordType(TsKeywordType {
-                    span,
-                    kind: TsKeywordTypeKind::TsAnyKeyword,
-                })
-            }
-        }
+#[derive(Clone, Copy)]
+enum PatternTypeAnnMode {
+    FromJson,
+    Omit,
+}
+
+trait MemberExpressionExt {
+    fn property_base(&self) -> BaseNode;
+}
+
+impl MemberExpressionExt for MemberExpression {
+    fn property_base(&self) -> BaseNode {
+        ReverseCtx::expression_base(&self.property)
+            .cloned()
+            .unwrap_or_else(|| self.base.clone())
+    }
+}
+
+impl MemberExpressionExt for OptionalMemberExpression {
+    fn property_base(&self) -> BaseNode {
+        ReverseCtx::expression_base(&self.property)
+            .cloned()
+            .unwrap_or_else(|| self.base.clone())
+    }
+}
+
+fn bigint_literal_value(value: &str) -> &str {
+    value.strip_suffix('n').unwrap_or(value)
+}
+
+fn bigint_literal_raw(value: &str) -> Atom {
+    if value.ends_with('n') {
+        return Atom::from(value);
     }
 
-    // ===== Operators =====
+    let mut raw = String::with_capacity(value.len() + 1);
+    raw.push_str(value);
+    raw.push('n');
+    Atom::from(raw)
+}
 
-    fn convert_binary_operator(&self, op: &BinaryOperator) -> BinaryOp {
-        match op {
-            BinaryOperator::Add => BinaryOp::Add,
-            BinaryOperator::Sub => BinaryOp::Sub,
-            BinaryOperator::Mul => BinaryOp::Mul,
-            BinaryOperator::Div => BinaryOp::Div,
-            BinaryOperator::Rem => BinaryOp::Mod,
-            BinaryOperator::Exp => BinaryOp::Exp,
-            BinaryOperator::Eq => BinaryOp::EqEq,
-            BinaryOperator::StrictEq => BinaryOp::EqEqEq,
-            BinaryOperator::Neq => BinaryOp::NotEq,
-            BinaryOperator::StrictNeq => BinaryOp::NotEqEq,
-            BinaryOperator::Lt => BinaryOp::Lt,
-            BinaryOperator::Lte => BinaryOp::LtEq,
-            BinaryOperator::Gt => BinaryOp::Gt,
-            BinaryOperator::Gte => BinaryOp::GtEq,
-            BinaryOperator::Shl => BinaryOp::LShift,
-            BinaryOperator::Shr => BinaryOp::RShift,
-            BinaryOperator::UShr => BinaryOp::ZeroFillRShift,
-            BinaryOperator::BitOr => BinaryOp::BitOr,
-            BinaryOperator::BitXor => BinaryOp::BitXor,
-            BinaryOperator::BitAnd => BinaryOp::BitAnd,
-            BinaryOperator::In => BinaryOp::In,
-            BinaryOperator::Instanceof => BinaryOp::InstanceOf,
-            BinaryOperator::Pipeline => BinaryOp::BitOr, // no pipeline in SWC
+fn set_statement_span(stmt: &mut swc::Stmt, span: Span) {
+    match stmt {
+        swc::Stmt::Block(s) => s.span = span,
+        swc::Stmt::Empty(s) => s.span = span,
+        swc::Stmt::Debugger(s) => s.span = span,
+        swc::Stmt::With(s) => s.span = span,
+        swc::Stmt::Return(s) => s.span = span,
+        swc::Stmt::Labeled(s) => s.span = span,
+        swc::Stmt::Break(s) => s.span = span,
+        swc::Stmt::Continue(s) => s.span = span,
+        swc::Stmt::If(s) => s.span = span,
+        swc::Stmt::Switch(s) => s.span = span,
+        swc::Stmt::Throw(s) => s.span = span,
+        swc::Stmt::Try(s) => s.span = span,
+        swc::Stmt::While(s) => s.span = span,
+        swc::Stmt::DoWhile(s) => s.span = span,
+        swc::Stmt::For(s) => s.span = span,
+        swc::Stmt::ForIn(s) => s.span = span,
+        swc::Stmt::ForOf(s) => s.span = span,
+        swc::Stmt::Decl(decl) => match decl {
+            swc::Decl::Class(d) => d.class.span = span,
+            swc::Decl::Fn(d) => d.function.span = span,
+            swc::Decl::Var(d) => d.span = span,
+            swc::Decl::Using(d) => d.span = span,
+            swc::Decl::TsInterface(d) => d.span = span,
+            swc::Decl::TsTypeAlias(d) => d.span = span,
+            swc::Decl::TsEnum(d) => d.span = span,
+            swc::Decl::TsModule(d) => d.span = span,
+        },
+        swc::Stmt::Expr(s) => s.span = span,
+    }
+}
+
+fn encode_jsx_text(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '{' => escaped.push_str("&#123;"),
+            '}' => escaped.push_str("&#125;"),
+            _ => escaped.push(ch),
         }
     }
+    escaped
+}
 
-    fn convert_logical_operator(&self, op: &LogicalOperator) -> BinaryOp {
-        match op {
-            LogicalOperator::Or => BinaryOp::LogicalOr,
-            LogicalOperator::And => BinaryOp::LogicalAnd,
-            LogicalOperator::NullishCoalescing => BinaryOp::NullishCoalescing,
-        }
+#[cold]
+fn json_type(value: &Value) -> Option<&str> {
+    json_str(value, "type")
+}
+
+#[cold]
+fn json_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key)?.as_str()
+}
+
+#[cold]
+fn json_bool(value: &Value, key: &str) -> Option<bool> {
+    value.get(key)?.as_bool()
+}
+
+#[cold]
+fn json_f64(value: &Value, key: &str) -> Option<f64> {
+    value.get(key)?.as_f64()
+}
+
+#[cold]
+fn json_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key)?.as_u64()
+}
+
+#[cold]
+fn json_array<'a>(value: &'a Value, key: &str) -> Option<&'a [Value]> {
+    value.get(key)?.as_array().map(std::vec::Vec::as_slice)
+}
+
+#[cold]
+fn ts_keyword_type_kind(type_name: &str) -> Option<swc::TsKeywordTypeKind> {
+    match type_name {
+        "TSAnyKeyword" => Some(swc::TsKeywordTypeKind::TsAnyKeyword),
+        "TSBigIntKeyword" => Some(swc::TsKeywordTypeKind::TsBigIntKeyword),
+        "TSBooleanKeyword" => Some(swc::TsKeywordTypeKind::TsBooleanKeyword),
+        "TSIntrinsicKeyword" => Some(swc::TsKeywordTypeKind::TsIntrinsicKeyword),
+        "TSNeverKeyword" => Some(swc::TsKeywordTypeKind::TsNeverKeyword),
+        "TSNullKeyword" => Some(swc::TsKeywordTypeKind::TsNullKeyword),
+        "TSNumberKeyword" => Some(swc::TsKeywordTypeKind::TsNumberKeyword),
+        "TSObjectKeyword" => Some(swc::TsKeywordTypeKind::TsObjectKeyword),
+        "TSStringKeyword" => Some(swc::TsKeywordTypeKind::TsStringKeyword),
+        "TSSymbolKeyword" => Some(swc::TsKeywordTypeKind::TsSymbolKeyword),
+        "TSUndefinedKeyword" => Some(swc::TsKeywordTypeKind::TsUndefinedKeyword),
+        "TSUnknownKeyword" => Some(swc::TsKeywordTypeKind::TsUnknownKeyword),
+        "TSVoidKeyword" => Some(swc::TsKeywordTypeKind::TsVoidKeyword),
+        _ => None,
     }
+}
 
-    fn convert_unary_operator(&self, op: &UnaryOperator) -> UnaryOp {
-        match op {
-            UnaryOperator::Neg => UnaryOp::Minus,
-            UnaryOperator::Plus => UnaryOp::Plus,
-            UnaryOperator::Not => UnaryOp::Bang,
-            UnaryOperator::BitNot => UnaryOp::Tilde,
-            UnaryOperator::TypeOf => UnaryOp::TypeOf,
-            UnaryOperator::Void => UnaryOp::Void,
-            UnaryOperator::Delete => UnaryOp::Delete,
-            UnaryOperator::Throw => UnaryOp::Void, // no throw-as-unary in SWC
-        }
-    }
-
-    fn convert_update_operator(&self, op: &UpdateOperator) -> UpdateOp {
-        match op {
-            UpdateOperator::Increment => UpdateOp::PlusPlus,
-            UpdateOperator::Decrement => UpdateOp::MinusMinus,
-        }
-    }
-
-    fn convert_assignment_operator(&self, op: &AssignmentOperator) -> AssignOp {
-        match op {
-            AssignmentOperator::Assign => AssignOp::Assign,
-            AssignmentOperator::AddAssign => AssignOp::AddAssign,
-            AssignmentOperator::SubAssign => AssignOp::SubAssign,
-            AssignmentOperator::MulAssign => AssignOp::MulAssign,
-            AssignmentOperator::DivAssign => AssignOp::DivAssign,
-            AssignmentOperator::RemAssign => AssignOp::ModAssign,
-            AssignmentOperator::ExpAssign => AssignOp::ExpAssign,
-            AssignmentOperator::ShlAssign => AssignOp::LShiftAssign,
-            AssignmentOperator::ShrAssign => AssignOp::RShiftAssign,
-            AssignmentOperator::UShrAssign => AssignOp::ZeroFillRShiftAssign,
-            AssignmentOperator::BitOrAssign => AssignOp::BitOrAssign,
-            AssignmentOperator::BitXorAssign => AssignOp::BitXorAssign,
-            AssignmentOperator::BitAndAssign => AssignOp::BitAndAssign,
-            AssignmentOperator::OrAssign => AssignOp::OrAssign,
-            AssignmentOperator::AndAssign => AssignOp::AndAssign,
-            AssignmentOperator::NullishAssign => AssignOp::NullishAssign,
-        }
+#[cold]
+fn ts_type_operator_op(operator: &str) -> Option<swc::TsTypeOperatorOp> {
+    match operator {
+        "keyof" => Some(swc::TsTypeOperatorOp::KeyOf),
+        "unique" => Some(swc::TsTypeOperatorOp::Unique),
+        "readonly" => Some(swc::TsTypeOperatorOp::ReadOnly),
+        _ => None,
     }
 }
