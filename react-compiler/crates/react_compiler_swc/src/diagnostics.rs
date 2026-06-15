@@ -20,7 +20,8 @@ pub struct DiagnosticMessage {
     pub span: Option<(u32, u32)>,
 }
 
-/// Converts a CompileResult into diagnostic messages for display
+/// Convert a [`CompileResult`] into SWC-facing diagnostics.
+#[must_use]
 pub fn compile_result_to_diagnostics(result: &CompileResult) -> Vec<DiagnosticMessage> {
     let mut diagnostics = Vec::new();
 
@@ -33,9 +34,7 @@ pub fn compile_result_to_diagnostics(result: &CompileResult) -> Vec<DiagnosticMe
                 }
             }
         }
-        CompileResult::Error {
-            error, events, ..
-        } => {
+        CompileResult::Error { error, events, .. } => {
             // Add the main error
             diagnostics.push(error_info_to_diagnostic(error));
 
@@ -52,11 +51,11 @@ pub fn compile_result_to_diagnostics(result: &CompileResult) -> Vec<DiagnosticMe
 }
 
 fn error_info_to_diagnostic(error: &CompilerErrorInfo) -> DiagnosticMessage {
-    let message = if let Some(description) = &error.description {
-        format!("[ReactCompiler] {}. {}", error.reason, description)
-    } else {
-        format!("[ReactCompiler] {}", error.reason)
-    };
+    let mut message = format!("[ReactCompiler] {}", error.reason);
+    if let Some(description) = &error.description {
+        message.push_str(": ");
+        message.push_str(description);
+    }
 
     DiagnosticMessage {
         severity: Severity::Error,
@@ -65,7 +64,7 @@ fn error_info_to_diagnostic(error: &CompilerErrorInfo) -> DiagnosticMessage {
     }
 }
 
-fn error_detail_to_diagnostic(detail: &CompilerErrorDetailInfo, is_error: bool) -> DiagnosticMessage {
+fn error_detail_to_diagnostic(detail: &CompilerErrorDetailInfo) -> Option<DiagnosticMessage> {
     let message = if let Some(description) = &detail.description {
         format!(
             "[ReactCompiler] {}: {}. {}",
@@ -75,33 +74,35 @@ fn error_detail_to_diagnostic(detail: &CompilerErrorDetailInfo, is_error: bool) 
         format!("[ReactCompiler] {}: {}", detail.category, detail.reason)
     };
 
-    DiagnosticMessage {
-        severity: if is_error {
-            Severity::Error
-        } else {
-            Severity::Warning
-        },
+    // This is React Compiler's display severity for the diagnostic detail. Fatal
+    // transform errors are represented separately by `CompileResult::Error`.
+    let severity = match detail.severity.as_str() {
+        "Off" => return None,
+        "Error" => Severity::Error,
+        // `Warning`, `Hint`, and any unknown future value surface as warnings.
+        _ => Severity::Warning,
+    };
+
+    Some(DiagnosticMessage {
+        severity,
         message,
         span: None,
-    }
+    })
 }
 
 fn event_to_diagnostic(event: &LoggerEvent) -> Option<DiagnosticMessage> {
     match event {
-        LoggerEvent::CompileSuccess { .. } => None,
-        LoggerEvent::CompileSkip { .. } => None,
+        LoggerEvent::CompileSuccess { .. } | LoggerEvent::CompileSkip { .. } => None,
         LoggerEvent::CompileError { detail, .. }
-        | LoggerEvent::CompileErrorWithLoc { detail, .. } => {
-            Some(error_detail_to_diagnostic(detail, false))
-        }
+        | LoggerEvent::CompileErrorWithLoc { detail, .. } => error_detail_to_diagnostic(detail),
         LoggerEvent::CompileUnexpectedThrow { data, .. } => Some(DiagnosticMessage {
             severity: Severity::Error,
-            message: format!("[ReactCompiler] Unexpected error: {}", data),
+            message: format!("[ReactCompiler] Unexpected error: {data}"),
             span: None,
         }),
         LoggerEvent::PipelineError { data, .. } => Some(DiagnosticMessage {
             severity: Severity::Error,
-            message: format!("[ReactCompiler] Pipeline error: {}", data),
+            message: format!("[ReactCompiler] Pipeline error: {data}"),
             span: None,
         }),
     }

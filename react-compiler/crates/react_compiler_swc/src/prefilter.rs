@@ -3,64 +3,99 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
-use swc_ecma_ast::{
-    ArrowExpr, AssignExpr, AssignTarget, Callee, Class, Expr, FnDecl, FnExpr, MemberProp,
-    Module, Pat, SimpleAssignTarget, VarDeclarator, CallExpr,
-};
-use swc_ecma_visit::Visit;
+use react_compiler_hir::environment::is_react_like_name;
+use swc_ecma_ast as swc;
+use swc_ecma_visit::{Visit, VisitWith};
 
-/// Checks if a module contains React-like functions (components or hooks).
-///
-/// A React-like function is one whose name:
-/// - Starts with an uppercase letter (component convention)
-/// - Matches the pattern `use[A-Z0-9]` (hook convention)
-pub fn has_react_like_functions(module: &Module) -> bool {
+/// Whether the program contains a component or hook candidate.
+pub fn has_react_like_functions(program: &swc::Program) -> bool {
     let mut visitor = ReactLikeVisitor {
         found: false,
         current_name: None,
     };
-    visitor.visit_module(module);
+    program.visit_with(&mut visitor);
     visitor.found
 }
 
-use react_compiler_hir::environment::is_react_like_name;
+/// Whether the program contains `using` or `await using` declarations.
+pub fn has_resource_management_declarations(program: &swc::Program) -> bool {
+    let mut visitor = ResourceManagementVisitor { found: false };
+    program.visit_with(&mut visitor);
+    visitor.found
+}
+
+/// `memo`/`forwardRef` wrappers mark callback functions as component-like even
+/// when the callback itself is anonymous.
+fn is_component_wrapper(callee: &swc::Callee) -> bool {
+    let is_wrapper = |name: &str| matches!(name, "memo" | "forwardRef");
+    match callee {
+        swc::Callee::Expr(expr) => match &**expr {
+            swc::Expr::Ident(id) => is_wrapper(&id.sym),
+            swc::Expr::Member(member) => match &member.prop {
+                swc::MemberProp::Ident(prop) => is_wrapper(&prop.sym),
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
+    }
+}
 
 struct ReactLikeVisitor {
     found: bool,
     current_name: Option<String>,
 }
 
+struct ResourceManagementVisitor {
+    found: bool,
+}
+
+impl Visit for ResourceManagementVisitor {
+    fn visit_var_decl(&mut self, decl: &swc::VarDecl) {
+        if self.found {
+            return;
+        }
+        decl.visit_children_with(self);
+    }
+
+    fn visit_using_decl(&mut self, decl: &swc::UsingDecl) {
+        if self.found {
+            return;
+        }
+        self.found = true;
+        let _ = decl;
+    }
+}
+
 impl Visit for ReactLikeVisitor {
-    fn visit_var_declarator(&mut self, decl: &VarDeclarator) {
+    fn visit_var_declarator(&mut self, decl: &swc::VarDeclarator) {
         if self.found {
             return;
         }
 
-        // Extract name from the binding identifier
         let name = match &decl.name {
-            Pat::Ident(binding_ident) => Some(binding_ident.id.sym.to_string()),
+            swc::Pat::Ident(ident) => Some(ident.id.sym.to_string()),
             _ => None,
         };
 
         let prev_name = self.current_name.take();
         self.current_name = name;
 
-        // Visit the initializer with the name in scope
         if let Some(init) = &decl.init {
-            self.visit_expr(init);
+            init.visit_with(self);
         }
 
         self.current_name = prev_name;
     }
 
-    fn visit_assign_expr(&mut self, expr: &AssignExpr) {
+    fn visit_assign_expr(&mut self, expr: &swc::AssignExpr) {
         if self.found {
             return;
         }
 
         let name = match &expr.left {
-            AssignTarget::Simple(SimpleAssignTarget::Ident(binding_ident)) => {
-                Some(binding_ident.id.sym.to_string())
+            swc::AssignTarget::Simple(swc::SimpleAssignTarget::Ident(ident)) => {
+                Some(ident.id.sym.to_string())
             }
             _ => None,
         };
@@ -68,30 +103,28 @@ impl Visit for ReactLikeVisitor {
         let prev_name = self.current_name.take();
         self.current_name = name;
 
-        self.visit_expr(&expr.right);
+        expr.right.visit_with(self);
 
         self.current_name = prev_name;
     }
 
-    fn visit_fn_decl(&mut self, decl: &FnDecl) {
+    fn visit_fn_decl(&mut self, decl: &swc::FnDecl) {
         if self.found {
             return;
         }
 
         if is_react_like_name(&decl.ident.sym) {
             self.found = true;
-            return;
         }
 
-        // Don't traverse into the function body
+        // Do not traverse into function bodies.
     }
 
-    fn visit_fn_expr(&mut self, expr: &FnExpr) {
+    fn visit_fn_expr(&mut self, expr: &swc::FnExpr) {
         if self.found {
             return;
         }
 
-        // Check explicit function name
         if let Some(id) = &expr.ident {
             if is_react_like_name(&id.sym) {
                 self.found = true;
@@ -99,20 +132,18 @@ impl Visit for ReactLikeVisitor {
             }
         }
 
-        // Check inferred name from parent context
         if expr.ident.is_none() {
             if let Some(name) = &self.current_name {
                 if is_react_like_name(name) {
                     self.found = true;
-                    return;
                 }
             }
         }
 
-        // Don't traverse into the function body
+        // Do not traverse into function bodies.
     }
 
-    fn visit_arrow_expr(&mut self, _expr: &ArrowExpr) {
+    fn visit_arrow_expr(&mut self, expr: &swc::ArrowExpr) {
         if self.found {
             return;
         }
@@ -124,82 +155,30 @@ impl Visit for ReactLikeVisitor {
             }
         }
 
-        // Don't traverse into the function body
+        // Do not traverse into function bodies.
+        let _ = expr;
     }
 
-    fn visit_call_expr(&mut self, call: &CallExpr) {
+    fn visit_call_expr(&mut self, call: &swc::CallExpr) {
         if self.found {
             return;
         }
 
-        // Check if this is memo(fn) / forwardRef(fn) / React.memo(fn) / React.forwardRef(fn)
-        if is_memo_or_forward_ref_call(call) {
-            // If the first arg is a function expression or arrow, mark as found
-            if let Some(first_arg) = call.args.first() {
-                match &*first_arg.expr {
-                    Expr::Fn(_) | Expr::Arrow(_) => {
-                        self.found = true;
-                        return;
-                    }
-                    _ => {}
-                }
-            }
+        if is_component_wrapper(&call.callee)
+            && call
+                .args
+                .iter()
+                .any(|arg| matches!(&*arg.expr, swc::Expr::Fn(_) | swc::Expr::Arrow(_)))
+        {
+            self.found = true;
+            return;
         }
 
-        // Continue traversal for other call expressions
-        // Visit args to find function expressions inside non-memo/forwardRef calls
-        for arg in &call.args {
-            self.visit_expr(&arg.expr);
-        }
+        call.visit_children_with(self);
     }
 
-    fn visit_class(&mut self, _class: &Class) {
-        // Skip class bodies entirely
-    }
-}
-
-fn is_memo_or_forward_ref_call(call: &CallExpr) -> bool {
-    match &call.callee {
-        Callee::Expr(expr) => match &**expr {
-            // Direct calls: memo(...) or forwardRef(...)
-            Expr::Ident(ident) => {
-                ident.sym == "memo" || ident.sym == "forwardRef"
-            }
-            // Member expression: React.memo(...) or React.forwardRef(...)
-            Expr::Member(member) => {
-                if let Expr::Ident(obj) = &*member.obj {
-                    if obj.sym == "React" {
-                        if let MemberProp::Ident(prop) = &member.prop {
-                            return prop.sym == "memo" || prop.sym == "forwardRef";
-                        }
-                    }
-                }
-                false
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_react_like_name() {
-        assert!(is_react_like_name("Component"));
-        assert!(is_react_like_name("MyComponent"));
-        assert!(is_react_like_name("A"));
-        assert!(is_react_like_name("useState"));
-        assert!(is_react_like_name("useEffect"));
-        assert!(is_react_like_name("use0"));
-
-        assert!(!is_react_like_name("component"));
-        assert!(!is_react_like_name("myFunction"));
-        assert!(!is_react_like_name("use"));
-        assert!(!is_react_like_name("user"));
-        assert!(!is_react_like_name("useful"));
-        assert!(!is_react_like_name(""));
+    fn visit_class(&mut self, class: &swc::Class) {
+        // Skip class bodies entirely.
+        let _ = class;
     }
 }
