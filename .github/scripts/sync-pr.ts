@@ -4,6 +4,8 @@ import { octokit, owner, repo } from './github-api.ts';
 
 const branch = process.env.BRANCH!;
 const upstreamRef = process.env.UPSTREAM_REF!;
+const reactSha = process.env.REACT_SHA ?? 'unknown';
+const swcSha = process.env.SWC_SHA ?? 'unknown';
 const baseSha = execSync('git rev-parse origin/main').toString().trim();
 
 const { additions, deletions } = collectFileChanges('react-compiler', 'origin/main');
@@ -13,12 +15,7 @@ if (additions.length === 0 && deletions.length === 0) {
   process.exit(0);
 }
 
-// Extract the vendored upstream SHA from the sync commit message for the PR description.
-let upstreamSha = 'unknown';
-for (const msg of execSync('git log --format=%s origin/main..HEAD').toString().trim().split('\n')) {
-  const m = msg.match(/\b([0-9a-f]{40})\b/);
-  if (m) { upstreamSha = m[1]; break; }
-}
+const commitHeadline = `vendor: react-compiler @ ${reactSha} swc @ ${swcSha}`;
 
 await octokit.rest.git.createRef({
   owner, repo,
@@ -36,8 +33,8 @@ await octokit.graphql(`
   input: {
     branch: { repositoryNameWithOwner: `${owner}/${repo}`, branchName: branch },
     message: {
-      headline: 'vendor: sync react-compiler upstream',
-      body: `Ref: \`${upstreamRef}\`, upstream commit: \`${upstreamSha}\`.`,
+      headline: commitHeadline,
+      body: `Synced from react/react ref \`${upstreamRef}\`.`,
     },
     fileChanges: { additions, deletions },
     expectedHeadOid: baseSha,
@@ -46,8 +43,8 @@ await octokit.graphql(`
 
 await octokit.rest.pulls.create({
   owner, repo,
-  title: 'vendor: sync react-compiler upstream',
-  body: `Automated sync via \`just sync && just codemod\`. Ref: \`${upstreamRef}\`, upstream commit: \`${upstreamSha}\`.`,
+  title: commitHeadline,
+  body: `Automated sync. react/react ref: \`${upstreamRef}\`, react SHA: \`${reactSha}\`, swc SHA: \`${swcSha}\`.`,
   head: branch,
   base: 'main',
 });
